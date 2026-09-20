@@ -37,6 +37,11 @@ KEEP="${TREE_IT_KEEP:-0}"
 COLS=110
 ROWS=32
 
+# Build this harness targets. Both the earlier b8973fb-era build and 014426f
+# report 26.9.1, so the revision is what distinguishes the lstat/File contract.
+EXPECTED_VERSION="26.9.1"
+EXPECTED_REVISION="014426f"
+
 SCENARIOS=(
 	startup
 	expand_collapse
@@ -137,6 +142,8 @@ CWD_FILE=""
 usage() {
 	cat <<EOF
 Usage: $(basename "$0") [--list] [--jobs N] [scenario ...]
+
+Targets Yazi ${EXPECTED_VERSION} (${EXPECTED_REVISION}).
 
 Scenarios:
 $(printf '  %s\n' "${SCENARIOS[@]}")
@@ -347,11 +354,16 @@ command -v tmux >/dev/null 2>&1 || fail "tmux is not installed"
 [ -f "$PLUGIN_DIR/main.lua" ] || fail "cannot find main.lua next to tests/"
 
 YAZI_VERSION="$(yazi --version 2>/dev/null | awk '/Version:/ { print $2; exit }')"
+YAZI_REVISION="$(yazi --version 2>/dev/null | sed -n 's/.*Version: *[^ ]* *(\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' | head -n1)"
 case "$YAZI_VERSION" in
-26.9.*) ;;
-*) fail "yazi ${YAZI_VERSION:-unknown} found; this harness targets 26.9.1" ;;
+"$EXPECTED_VERSION") ;;
+*) fail "yazi ${YAZI_VERSION:-unknown} found; this harness targets ${EXPECTED_VERSION} (${EXPECTED_REVISION})" ;;
 esac
-printf 'yazi %s, tmux %s\n' "$YAZI_VERSION" "$(tmux -V | awk '{print $2}')"
+case "$YAZI_REVISION" in
+"$EXPECTED_REVISION") ;;
+*) fail "yazi ${YAZI_VERSION} (${YAZI_REVISION:-unknown revision}) found; this harness targets ${EXPECTED_VERSION} (${EXPECTED_REVISION})" ;;
+esac
+printf 'yazi %s (%s), tmux %s\n' "$YAZI_VERSION" "$YAZI_REVISION" "$(tmux -V | awk '{print $2}')"
 
 scenarios_run=()
 if [ "$run_all" -eq 1 ]; then

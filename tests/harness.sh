@@ -325,15 +325,31 @@ launch_cwds() {
 	wait_ready
 }
 
+# Wait until the active pane is interactive AND its folder has finished
+# loading. The status line alone reaches `NOR` while the current folder can
+# still be in Yazi's native `Loading...` stage (the stock current component
+# renders that placeholder whenever `folder.stage()` is not done), so scenarios
+# must not proceed on the status line alone. A loaded folder renders its
+# entries, or `No items` when empty, hence the absence of the loading
+# placeholder is the readiness condition. A pane that never leaves the loading
+# state still fails within the same bounded wait, with a folder-specific
+# diagnostic instead of a downstream assertion failure.
 wait_ready() {
-	local i=0
+	local i=0 pane frame=0
 	while [ "$i" -lt 200 ]; do
-		if tmux -L "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null | grep -q 'NOR'; then
-			return 0
+		pane="$(tmux -L "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null || true)"
+		if printf '%s\n' "$pane" | grep -q 'NOR'; then
+			frame=1
+			if ! printf '%s\n' "$pane" | grep -qF 'Loading...'; then
+				return 0
+			fi
 		fi
 		sleep 0.05
 		i=$((i + 1))
 	done
+	if [ "$frame" -eq 1 ]; then
+		fail "yazi did not finish loading the active folder within 10s"
+	fi
 	fail "yazi did not reach an interactive frame within 10s"
 }
 

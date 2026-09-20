@@ -215,7 +215,13 @@ function M.run(ctx)
 	ya.emit("update_files", {
 		op = fs.op("done", {
 			id = ticket,
-			file = File({ url = Url(cwd_str), cha = fs.cha(Url(cwd_str), false) }),
+			-- 26.9.1 (014426f) lstat contract: File takes followed `stat` plus
+			-- unfollowed `lstat` instead of the removed `cha` field.
+			file = File({
+				url = Url(cwd_str),
+				stat = fs.cha(Url(cwd_str), true),
+				lstat = fs.cha(Url(cwd_str), false),
+			}),
 		}),
 	})
 

@@ -103,6 +103,15 @@ SCENARIOS=(
 	search_rerun
 	search_stock_filter
 	search_toggle_defer
+	external_create_deep
+	external_delete_deep
+	external_rename_file_deep
+	external_filter_preserved
+	external_no_churn
+	external_search_view_ignored
+	external_rename_dir_preserved
+	external_recreate_prunes
+	external_preview_write_refresh
 	cleanup
 )
 
@@ -146,6 +155,10 @@ CWD_FILE=""
 
 # Search-view suite: native fd/rg Views in tree and classic tabs (cd/rebuild/render).
 . "$HERE/scenarios_search.sh"
+
+# External-change suite: bounded polling of expanded directories (create/delete/
+# rename visibility, filter/hover retention, provider-view scope, no idle churn).
+. "$HERE/scenarios_external.sh"
 
 # ---------------------------------------------------------------------------
 # Entry point

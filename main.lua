@@ -137,6 +137,9 @@ M.injected = false -- whether the last completed rebuild injected descendants
 M.injecting = false -- a rebuild is scheduled or in flight (not yet completed)
 M.root_order = nil -- authoritative depth-0 URL order (kept across rebuilds/rename)
 M.filter_query = nil -- active hierarchy-aware tree filter query; nil shows every row
+M.dir_sig = {} -- url -> { mtime, is_dir }: last successful expanded-dir metadata
+M.poller = nil -- ya.async Handle of the active external-change poll loop
+M.poller_token = nil -- identity of the loop M.poller currently refers to
 
 -- Per-tab / per-root persistence. M.expanded/M.rows/M.root_order/M.filter_query
 -- stay the live state for the active tab, while M.tabs owns everything that must
@@ -449,6 +452,30 @@ local set_rows = ya.sync(function(_, gen, tab, rows)
 	end
 end)
 
+-- Reconcile the live expansion set with what a completed rebuild actually
+-- reached. A key whose chain of expanded ancestors no longer leads to it is
+-- stale, so it is dropped here: the old URL becomes a tombstone and a directory
+-- later recreated there cannot silently auto-expand. Keys under a directory
+-- whose read failed are retained by the caller because that subtree is
+-- unverifiable, not proven gone. Same generation/tab gate as every other
+-- rebuild bridge, so a superseded rebuild cannot clobber newer user state.
+local set_expanded = ya.sync(function(_, gen, tab, retained)
+	if M.gen == gen and M.active_tab == tab then
+		local new = {}
+		for _, u in ipairs(retained) do
+			new[u] = true
+		end
+		M.expanded = new
+		-- Drop signatures for pruned keys so the next poll does not report a
+		-- spurious change for a directory the plugin no longer tracks.
+		for u in pairs(M.dir_sig) do
+			if not new[u] then
+				M.dir_sig[u] = nil
+			end
+		end
+	end
+end)
+
 -- Completion marker: only the generation and tab that still own the folder may
 -- clear the pending flag and record whether descendants are now injected. A
 -- failed read passes nil and only clears the in-flight flag, or every later
@@ -547,6 +574,7 @@ local function rebuild(gen, focus_str, pin)
 			check_gen = check_gen,
 			set_root_order = set_root_order,
 			set_rows = set_rows,
+			set_expanded = set_expanded,
 			finish_rebuild = finish_rebuild,
 		})
 	end)
@@ -763,6 +791,7 @@ local function reconcile_root()
 			rebuild(M.gen, nil)
 		end
 	end
+	ui.render()
 end
 
 -- Forget `target` and every expanded directory inside its subtree, comparing
@@ -799,7 +828,7 @@ local function remap_abs(url_str, from_str, to_str)
 	end
 	local prefix = from_str .. "/"
 	if url_str:sub(1, #prefix) == prefix then
-		return to_str .. url_str:sub(#from_str)
+		return to_str .. url_str:sub(#from_str + 1)
 	end
 	return url_str
 end
@@ -823,7 +852,7 @@ local function remap_abs_bulk(map, url_str)
 	if not best_from then
 		return url_str
 	end
-	return best_to .. url_str:sub(#best_from)
+	return best_to .. url_str:sub(#best_from + 1)
 end
 
 -- Re-keyed copy of an expansion key set under `resolve`, computed against the
@@ -1126,6 +1155,392 @@ local function commit_mutation(focus, new_expanded, new_root_order)
 	rebuild(M.gen, focus)
 end
 
+-- ---------------------------------------------------------------------------
+-- External-change polling. Yazi's watcher only covers the active tab's current,
+-- parent, and hovered folders non-recursively, so a mutation inside an expanded
+-- directory at depth >= 1 never reaches the injected rows. The plugin keeps one
+-- bounded poll loop alive for the active physical tree session: once per tick it
+-- reads unfollowed metadata for each currently expanded directory and coalesces
+-- any change, disappearance, or read failure into a single existing
+-- generation-guarded rebuild. Collapsed subtrees, inactive saved roots, and
+-- native fd/rg provider Views are never polled, and the plugin deliberately
+-- does not touch the undocumented `watch`/`load` internals.
+-- ---------------------------------------------------------------------------
+
+-- Worst-case detection latency for one metadata tick. Directory mtime normally
+-- changes on a direct child create/remove/rename, so a real change lands within
+-- roughly one interval plus the rebuild.
+local POLL_INTERVAL = 1.0
+
+-- Identity of the newest poll session. Bumping it makes any older loop exit or
+-- drop its result at the next scope/commit check, so a handle captured before a
+-- lifecycle transition can never rebuild a different tab/root afterwards.
+local poll_token = 0
+
+-- Snapshot the active tree session for one tick. Runs in the sync context (with
+-- M/cx access). Returns nil when the plugin no longer owns the active view
+-- (tree off, classic tab, or a native fd/rg provider View) or when this loop has
+-- been superseded, which makes the caller stop.
+local poll_scope = ya.sync(function(_, token)
+	if token ~= poll_token or not active_tree() then
+		return nil
+	end
+	local tab = M.active_tab
+	if not tab then
+		return nil
+	end
+	local urls = {}
+	for url_str in pairs(M.expanded) do
+		urls[#urls + 1] = url_str
+	end
+	table.sort(urls)
+	local sig = {}
+	for _, url_str in ipairs(urls) do
+		local s = M.dir_sig[url_str]
+		if s then
+			sig[url_str] = { mtime = s.mtime, is_dir = s.is_dir, dev = s.dev, btime = s.btime }
+		end
+	end
+	local h = hovered()
+	-- The one nested file the poll watches for content-only writes: the hovered
+	-- visible injected regular file (depth > 0). Root-level writes are already
+	-- covered by Yazi's own watcher, and a directory preview is limited to
+	-- listing changes in expanded dirs. The baseline is the displayed File's own
+	-- followed stat, so a hover change self-resets and no field persists.
+	local hover_file
+	if h and h.cha and not h.cha.is_dir and relative_of(h):find("/", 1, true) then
+		hover_file = { url = tostring(h.url), mtime = h.cha.mtime, len = h.cha.len }
+	end
+	return {
+		gen = M.gen,
+		tab = tab,
+		root = tostring(cx.active.current.cwd),
+		urls = urls,
+		sig = sig,
+		injecting = M.injecting,
+		-- Captured here, not at commit time: a stock operation on an injected
+		-- row can reset the Folder cursor between this snapshot and the commit,
+		-- and the pre-reset hover is the position the poll must preserve.
+		hover = h and tostring(h.url) or nil,
+		hover_file = hover_file,
+	}
+end)
+
+-- Install the tick's compact snapshot and, when the tick observed a real
+-- change, coalesce exactly one rebuild through the existing guards. A newer
+-- generation means an action or mutation event already owns the folder: the
+-- tick yields without installing its snapshot so the next tick re-detects the
+-- change once the folder is quiet. The snapshot otherwise replaces M.dir_sig
+-- wholesale, so signatures for directories that are no longer expanded (or
+-- belonged to a previous root) are pruned. Runs in the sync context.
+--
+-- `moves` (old URL -> new URL) and `prunes` (old URLs) describe an external
+-- rename the async scan resolved by directory identity. They are applied to the
+-- live and saved expansion state through the same remap/prune machinery the
+-- rename/remove events use, before the one rebuild that follows.
+local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, hover, dirty, moves, prunes)
+	if token ~= poll_token or not active_tree() then
+		return false
+	end
+	if M.active_tab ~= tab or tab ~= active_id() then
+		return false
+	end
+	if tostring(cx.active.current.cwd) ~= root then
+		return false
+	end
+	if M.gen ~= gen then
+		ya.dbg("[tree-dbg] poll change deferred; gen=", M.gen, "tick_gen=", gen)
+		return false
+	end
+	M.dir_sig = sig
+	if not dirty and not moves and not prunes then
+		return false
+	end
+	if moves then
+		-- Simultaneous longest-prefix resolution so a swap or chain stays
+		-- order-independent; the destination key itself is absent from `sig`
+		-- and is baselined on the next tick.
+		local resolve = function(u)
+			return remap_abs_bulk(moves, u)
+		end
+		M.expanded = remap_key_set(M.expanded, resolve)
+		if M.root_order then
+			M.root_order = remap_list(M.root_order, resolve)
+		end
+	end
+	if prunes then
+		for _, u in ipairs(prunes) do
+			prune_expanded(u)
+		end
+	end
+	if moves or prunes then
+		-- Inactive tabs' saved roots and last-seen roots move/prune with the
+		-- same absolute-URL policy as the rename/remove events.
+		remap_saved_bulk(moves or {})
+		prune_saved(prunes or {})
+		ya.dbg(
+			"[tree-dbg] poll remap; moves="
+				.. tostring(moves and count_keys(moves) or 0)
+				.. " prunes="
+				.. tostring(prunes and #prunes or 0)
+		)
+	end
+	M.gen = M.gen + 1
+	-- Focus the exact pre-change hover rather than reassert's filter-aware root
+	-- ancestor: the poll re-applies the same filter, so a hovered nested row that
+	-- was visible before the change is still visible after it, and collapsing the
+	-- focus to its root would move the cursor off it. A vanished hover is a
+	-- no-op in M:focus. A hover inside a moved subtree follows the directory.
+	local focus = hover
+	if focus and moves then
+		focus = remap_abs_bulk(moves, focus)
+	end
+	ya.dbg(
+		"[tree-dbg] poll change; gen=",
+		M.gen,
+		"focus=",
+		tostring(focus),
+		"moves=",
+		moves and count_keys(moves) or 0,
+		"prunes=",
+		prunes and #prunes or 0
+	)
+	M.pending_focus = focus
+	ui.render()
+	rebuild(M.gen, focus)
+	return true
+end)
+
+-- Clear M.poller only if it still refers to the loop that just ended, so a
+-- superseded loop finishing later cannot clear a newer handle.
+local poll_finish = ya.sync(function(_, token)
+	if M.poller_token == token then
+		M.poller = nil
+		M.poller_token = nil
+		M.dir_sig = {}
+	end
+end)
+
+-- Stable directory identity available to Lua on this Yazi: (dev, btime). A
+-- same-filesystem rename/move preserves both while ctime changes, so this pair
+-- distinguishes a moved directory from a same-path delete+recreate. Returns nil
+-- when either half is unavailable (some overlay/FUSE/FAT filesystems), which
+-- makes the caller prune safely instead of guessing.
+local function dir_identity(dev, btime)
+	if dev == nil or btime == nil then
+		return nil
+	end
+	-- %.17g round-trips an f64 exactly; the default tostring precision would
+	-- round two directories created within 0.1ms to the same key.
+	return string.format("%.17g:%.17g", dev, btime)
+end
+
+-- One-shot bounded scan after a tick observed expanded directories disappear or
+-- be replaced. Candidate parents are the root and every surviving expanded
+-- directory (the reachability invariant guarantees a lost key's parent is in
+-- that set); their real child directories are indexed by identity. Each topmost
+-- lost key resolves to its unique identity match as a move, or is pruned when
+-- there is no match, more than one match, or no usable identity. A descendant of
+-- a lost key is covered by its ancestor's prefix remap, so only the shallowest
+-- loss of each chain is searched. Returns `moves` (old -> new) and `prunes`.
+local function poll_scan(scope, lost)
+	local order = {}
+	for u in pairs(lost) do
+		order[#order + 1] = u
+	end
+	table.sort(order, function(a, b)
+		if #a ~= #b then
+			return #a < #b
+		end
+		return a < b
+	end)
+
+	-- Topmost losses only: ancestors sort first by path length.
+	local topmost, wanted = {}, {}
+	for _, u in ipairs(order) do
+		local covered = false
+		for _, t in ipairs(topmost) do
+			if u == t or u:sub(1, #t + 1) == t .. "/" then
+				covered = true
+				break
+			end
+		end
+		if not covered then
+			topmost[#topmost + 1] = u
+			local id = dir_identity(lost[u].dev, lost[u].btime)
+			if id then
+				wanted[id] = true
+			end
+		end
+	end
+
+	local parents, seen = {}, {}
+	local known = { [scope.root] = true }
+	local function add_parent(p)
+		if p and not seen[p] then
+			seen[p] = true
+			parents[#parents + 1] = p
+		end
+	end
+	add_parent(scope.root)
+	for _, u in ipairs(scope.urls) do
+		known[u] = true
+		if not lost[u] then
+			add_parent(u)
+		end
+	end
+
+	-- Index real child directories by identity, excluding every URL the plugin
+	-- already knows (an expanded key or the root): those cannot be the
+	-- destination of a move. All candidate parents are read so a coincidental
+	-- second match is seen and turns into a safe prune; symlinked/indirect
+	-- directories are excluded for the same cycle-safety reason the rebuild
+	-- refuses to descend them.
+	local matches = {}
+	for _, p in ipairs(parents) do
+		local kids = fs.read_dir(Url(p), { resolve = true })
+		if kids then
+			for _, k in ipairs(kids) do
+				local u = tostring(k.url)
+				local cha = k.cha
+				if
+					not known[u]
+					and cha
+					and cha.is_dir
+					and not cha.is_link
+					and not cha.is_indirect
+				then
+					local id = dir_identity(cha.dev, cha.btime)
+					if id and wanted[id] then
+						local list = matches[id]
+						if not list then
+							list = {}
+							matches[id] = list
+						end
+						list[#list + 1] = u
+					end
+				end
+			end
+		end
+	end
+
+	local moves, prunes = {}, {}
+	for _, u in ipairs(topmost) do
+		local id = dir_identity(lost[u].dev, lost[u].btime)
+		local dest
+		if id then
+			local list = matches[id]
+			if list and #list == 1 then
+				dest = list[1]
+			end
+		end
+		if dest and dest ~= u then
+			moves[u] = dest
+		else
+			prunes[#prunes + 1] = u
+		end
+	end
+	return next(moves) and moves or nil, #prunes > 0 and prunes or nil
+end
+
+-- One tick in the async context: read unfollowed metadata for every in-scope
+-- expanded directory and compare it to the last successful snapshot. A missing
+-- stat, a non-directory, a changed mtime/is_dir, or a changed (dev, btime) is a
+-- real change; a directory seen for the first time only establishes its
+-- baseline, so a fresh expansion never schedules a redundant rebuild. A lost or
+-- replaced directory additionally enters the bounded identity scan above, and
+-- the one hovered injected nested file is stat-followed so a content-only write
+-- (which does not change the directory mtime) still refreshes the preview.
+local function poll_tick(token)
+	local scope = poll_scope(token)
+	if not scope then
+		return false
+	end
+	-- A rebuild already re-reads disk; do not stack another one behind it.
+	if scope.injecting then
+		return true
+	end
+	local sig, dirty, lost = {}, false, {}
+	for _, url_str in ipairs(scope.urls) do
+		local stat = fs.cha(Url(url_str), false)
+		local prev = scope.sig[url_str]
+		if stat and stat.is_dir then
+			if
+				prev
+				and prev.btime ~= nil
+				and stat.btime ~= nil
+				and (prev.dev ~= stat.dev or prev.btime ~= stat.btime)
+			then
+				-- Same path, different directory: a delete+recreate or overwrite.
+				lost[url_str] = prev
+			else
+				sig[url_str] = { mtime = stat.mtime, is_dir = true, dev = stat.dev, btime = stat.btime }
+				if prev and (prev.is_dir ~= true or prev.mtime ~= stat.mtime) then
+					dirty = true
+				end
+			end
+		elseif prev then
+			-- Disappeared, replaced by a non-directory, or unreadable.
+			lost[url_str] = prev
+		end
+	end
+	local moves, prunes
+	if next(lost) then
+		moves, prunes = poll_scan(scope, lost)
+		dirty = true
+	end
+	if scope.hover_file and scope.hover_file.mtime ~= nil then
+		local stat = fs.cha(Url(scope.hover_file.url), true)
+		if not stat or stat.is_dir then
+			dirty = true
+		elseif stat.mtime ~= scope.hover_file.mtime or stat.len ~= scope.hover_file.len then
+			dirty = true
+		end
+	end
+	poll_apply(token, scope.gen, scope.tab, scope.root, sig, scope.hover, dirty, moves, prunes)
+	return true
+end
+
+-- Start the single poll loop for the active tree session. No-op while a loop is
+-- already alive: the loop re-reads its scope from M every tick, so cd/reroot and
+-- expansion/collapse are picked up in place without restarting it.
+local function ensure_poller()
+	if M.poller then
+		return
+	end
+	if not active_tree() then
+		return
+	end
+	poll_token = poll_token + 1
+	local token = poll_token
+	M.poller_token = token
+	M.dir_sig = {}
+	ya.dbg("[tree-dbg] poll start; token=", token)
+	M.poller = ya.async(function()
+		while true do
+			ya.sleep(POLL_INTERVAL)
+			if not poll_tick(token) then
+				break
+			end
+		end
+		poll_finish(token)
+	end)
+end
+
+-- Cancel the poll loop and drop its snapshot. Every lifecycle transition that
+-- leaves the active physical tree session (tree off, classic tab, provider
+-- View) funnels through here.
+local function stop_poller()
+	poll_token = poll_token + 1
+	if M.poller then
+		M.poller:abort()
+	end
+	M.poller = nil
+	M.poller_token = nil
+	M.dir_sig = {}
+	ya.dbg("[tree-dbg] poll stop")
+end
+
 -- r: tree-aware rename. Outside tree mode, for a depth-0 row, with a native
 -- multi-selection, or during an active visual range this delegates to stock
 -- rename (which routes selections to bulk rename, already remapped by the
@@ -1217,6 +1632,7 @@ function M:right()
 	ya.dbg("[tree-dbg] expand ", url_str)
 	ui.render()
 	rebuild(M.gen, url_str)
+	ensure_poller()
 end
 
 -- h: collapse the hovered expanded directory, or the immediate parent of a
@@ -1263,6 +1679,11 @@ function M:left()
 	ya.dbg("[tree-dbg] collapse ", target)
 	ui.render()
 	rebuild(M.gen, target)
+	-- Collapsing the last expanded directory leaves nothing to poll; stop the
+	-- loop instead of waking once per interval for an empty scope.
+	if next(M.expanded) == nil then
+		stop_poller()
+	end
 end
 
 -- H: reroot the tree one directory up (the parent of the current tree root).
@@ -1684,6 +2105,7 @@ local function activate(tab)
 		t.root = root
 		M.pending_focus, M.injected, M.injecting = nil, false, false
 		load_roots(t, root)
+		stop_poller()
 		apply_active()
 		prune_tabs()
 		return
@@ -1699,6 +2121,11 @@ local function activate(tab)
 	apply_active()
 	reconcile_root()
 	prune_tabs()
+	if t.tree then
+		ensure_poller()
+	else
+		stop_poller()
+	end
 end
 
 local function on_cd(payload)
@@ -1765,6 +2192,7 @@ local function on_cd(payload)
 			" tree=",
 			tostring(t.tree)
 		)
+		stop_poller()
 		return
 	end
 
@@ -1805,6 +2233,11 @@ local function on_cd(payload)
 		tostring(next(M.expanded) ~= nil)
 	)
 	reconcile_root()
+	if t.tree then
+		ensure_poller()
+	else
+		stop_poller()
+	end
 end
 
 -- Tab switch/create. The live M.* describes only the previously active tab, so
@@ -1992,6 +2425,7 @@ function M:toggle()
 			" recorded tree=",
 			tostring(t.tree)
 		)
+		stop_poller()
 		apply_active()
 		return
 	end
@@ -2031,6 +2465,7 @@ function M:toggle()
 		if had_work then
 			rebuild(M.gen, nil, false)
 		end
+		stop_poller()
 		restore_sort_for(t)
 		-- Hand native filtering back only after the root rows are re-injected,
 		-- so the restored query is applied to the real folder contents. cd and
@@ -2056,6 +2491,7 @@ function M:toggle()
 		else
 			reconcile_root()
 		end
+		ensure_poller()
 	end
 
 	apply_active()

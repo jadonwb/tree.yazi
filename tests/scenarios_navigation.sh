@@ -201,6 +201,7 @@ scenario_reroot() {
 	settle 1.4
 	header_has "$FIXTURE/sub/deep"
 	hovered_is 'leaf.txt' "nested file reveal"
+	pane_lacks '└─' "revealed nested file must be depth-0 (flush-left)"
 
 	snapshot reroot
 	assert_log_clean

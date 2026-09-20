@@ -177,6 +177,64 @@ successful rename. Delegated paths (outside tree mode, depth-0 rows, and
 multi-selections) keep stock behavior, including the preset `before_ext` caret
 placement.
 
+### External changes (bounded polling)
+
+Yazi's watcher is non-recursive and stock registers only the active tab's
+current, parent, and hovered folders, so a mutation inside an expanded directory
+at depth 1 or deeper never reaches the injected rows. While the active tab is a
+physical tree, the plugin therefore runs one bounded poll loop: once per second
+it reads unfollowed metadata (`fs.cha`) for every currently expanded directory
+and compares a compact `{ mtime, is_dir, dev, btime }` signature against its last
+successful snapshot. A changed mtime, a disappeared directory, a directory
+replaced by a different `(dev, btime)` identity or by a non-directory, or an
+unreadable one coalesces into a single existing generation-checked rebuild with
+the usual focus, filter, and root-order behavior, so external creates, deletes,
+and renames refresh visible descendants without touching the injected rows
+directly.
+
+Polling scope is intentionally narrow. Only the active tab's expanded
+directories are polled: collapsed subtrees are not descended, saved roots that
+belong to inactive tabs are never touched, and a native `fd://`/`rg://` provider
+View stops the loop entirely so the provider Folder is never reset. The plugin
+does not register any watch of its own and deliberately avoids Yazi's
+undocumented `watch`/`load` internals, which are unversioned and would replace
+Yazi's own watch set; if a stable upstream watcher API appears, this loop is the
+replacement point.
+
+An external rename of an expanded directory is preserved on a best-effort basis.
+When an expanded path disappears or its `(dev, btime)` changes, the plugin runs
+one bounded scan of the current root and the currently expanded directories
+(looking no further than that reachable set) for a unique child directory with
+the lost identity. On a unique match it remaps the moved directory's complete
+expansion prefix to the new URL — descendants, each tab's saved roots, and the
+depth-0 root order included — so the subtree stays expanded where it moved. With
+no match, more than one match, an unavailable identity, a cross-filesystem
+copy/delete, or a destination outside the reachable set, the obsolete prefix is
+pruned instead, becoming a tombstone: a directory later recreated at the old path
+cannot silently re-expand. Because only `dev` and `btime` are exposed to Lua (no
+inode), identity is not a universal guarantee — filesystems with unavailable or
+coarse birth times, ambiguous duplicate identities, and case-only renames on
+case-insensitive filesystems may collapse to the prune path, and a rename is
+detected within roughly one polling interval plus a rebuild.
+
+The rebuild also reconciles reachability: after re-reading the tree it keeps only
+the expansion keys it actually reached, plus keys under a directory whose listing
+failed (that subtree is unverifiable, not proven gone). A key whose expanded
+ancestor chain no longer leads to it is dropped, so a stale key removed from the
+live set cannot be resurrected by a later unrelated recreation of its path.
+
+Content-only writes are also covered for one file: the poll additionally
+stat-follows the currently hovered visible injected regular file (depth > 0) and
+compares its displayed `mtime`/`len`. On a difference, disappearance, or type
+change it schedules the same guarded rebuild, whose fresh `File` metadata makes
+Yazi's own preview logic rerun the previewer — no forced peek and no cwd change.
+This costs at most one extra stat per interval, and only while such a file is
+hovered. Writing the file's *contents* still does not change the parent
+directory's mtime, so an unexpanded or unhovered file relies on the usual
+collapse (`h`) and re-expand (`l`), and filesystems with coarse or unavailable
+directory timestamps (or where `mtime` is not exposed) may not observe directory
+changes at all.
+
 ### Removal (trash and permanent delete)
 
 Stock remove works on injected rows at every depth without plugin routing: `d`
@@ -466,13 +524,29 @@ normally afterwards.
   every reachable expanded directory with no per-directory entry limit and no
   children cache, so a rebuild's I/O is proportional to the total entries of the
   expanded directories, not just the visible window.
-- **Nested directories are not watched.** Yazi's watcher only covers the
-  current, parent, and hovered folders, non-recursively, and watcher ops for a
-  nested trail never touch the injected rows. Create, rename, copy/move, and
-  trash/permanent-delete completed through the plugin or stock remove rebuild
-  explicitly, and `duplicate`/`move` events refresh affected branches, but
-  unrelated external mutations inside a nested expanded directory may require
-  collapsing and re-expanding it.
+- **External changes below the root are polled, not watched.** Yazi's watcher
+  only covers the current, parent, and hovered folders, non-recursively, and
+  watcher ops for a nested trail never touch the injected rows. Instead the
+  plugin runs its own bounded poll (see *External changes (bounded polling)*):
+  once per second it reads unfollowed metadata for the active tab's expanded
+  directories and coalesces a real change into one guarded rebuild. Scope is
+  strictly the active tab's expanded directories, so collapsed subtrees and
+  saved roots of inactive tabs are never observed, and detection is delayed by
+  up to roughly one interval plus a rebuild. An expanded directory renamed
+  within the reachable set is remapped by its `(dev, btime)` identity and keeps
+  its expansion; an unmatched, ambiguous, cross-filesystem, or out-of-tree move
+  is pruned so an old path cannot auto-expand again. Identity is `(dev, btime)`
+  only (Lua has no inode): filesystems with unavailable or coarse birth times and
+  case-insensitive case-only renames may fall back to a plain collapse. The poll
+  also stat-follows the one hovered injected nested file, so a content-only write
+  to *that* file still refreshes the preview; direct child
+  create/remove/rename normally changes the directory mtime, but an unexpanded
+  or unhovered file-content write and coarse or unavailable directory timestamps
+  may not be seen, in which case collapse (`h`) and re-expand (`l`) the
+  directory. The plugin deliberately avoids Yazi's undocumented `watch`/`load`
+  internals. Create, rename, copy/move, and trash/permanent-delete completed
+  through the plugin or stock remove still rebuild explicitly, and
+  `duplicate`/`move` events refresh affected branches.
 - **Target-aware link/hardlink is stock-only.** Yazi 26.9.1 exposes no Lua task
   kind or `fs` call for symlinks/hardlinks, so target-aware `link`/`hardlink`
   cannot be reproduced and those actions still use the current directory.

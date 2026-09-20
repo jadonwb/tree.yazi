@@ -30,6 +30,7 @@ function M.run(ctx)
 	local check_gen = ctx.check_gen
 	local set_root_order = ctx.set_root_order
 	local set_rows = ctx.set_rows
+	local set_expanded = ctx.set_expanded
 	local finish_rebuild = ctx.finish_rebuild
 
 	local started = ya.time()
@@ -89,6 +90,10 @@ function M.run(ctx)
 		end
 	end
 
+	-- What the BFS actually reached, plus directories whose listing failed. A
+	-- reachable expanded key is live; a failed read means that subtree is
+	-- unverifiable, so its keys are retained rather than treated as deleted.
+	local reached, unreadable = {}, {}
 	while qi <= #queue do
 		if not check_gen(gen, tab) then
 			return
@@ -96,6 +101,7 @@ function M.run(ctx)
 		local f = queue[qi]
 		qi = qi + 1
 		local dir_str = tostring(f.url)
+		reached[dir_str] = true
 		local kids = fs.read_dir(Url(dir_str), { resolve = true })
 		dirs_read = dirs_read + 1
 		if kids then
@@ -107,6 +113,7 @@ function M.run(ctx)
 				end
 			end
 		else
+			unreadable[dir_str] = true
 			ya.dbg("[tree-dbg] nested read failed; dir=", dir_str)
 		end
 	end
@@ -202,6 +209,26 @@ function M.run(ctx)
 
 	set_root_order(gen, tab, order)
 	set_rows(gen, tab, rows)
+
+	-- Publish the reachable expansion set: keep a key when the BFS read it, or
+	-- when an ancestor's listing failed (its subtree cannot be proven gone).
+	-- Everything else is stale and is dropped, which is what stops a later
+	-- recreation of an old path from auto-expanding.
+	local retained = {}
+	local function under_unreadable(u)
+		for d in pairs(unreadable) do
+			if u == d or u:sub(1, #d + 1) == d .. "/" then
+				return true
+			end
+		end
+		return false
+	end
+	for _, u in ipairs(expanded) do
+		if reached[u] or under_unreadable(u) then
+			retained[#retained + 1] = u
+		end
+	end
+	set_expanded(gen, tab, retained)
 
 	-- Final generation+tab check right before the atomic emit sequence, so
 	-- a stale rebuild cannot reset a folder owned by a newer generation or

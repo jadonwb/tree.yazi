@@ -1,0 +1,3 @@
+[tree.default]
+kind = "view"
+run  = "tree-vfs"

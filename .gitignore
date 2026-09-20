@@ -1,0 +1,6 @@
+# Disposable runtime data for the tree-vfs prototype experiment.
+logs/
+out/
+state/
+xdg/
+fixture/

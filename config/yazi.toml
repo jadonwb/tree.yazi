@@ -1,0 +1,10 @@
+# Prototype-only config. Pins provider order (no re-sort) so the flat depth-first
+# listing from ReadDir is observable, and installs a non-destructive opener.
+[mgr]
+sort_by = "none"
+
+[opener]
+probe = [ { run = "cp %s /home/jadon/.config/yazi/plugins/tree-vfs.yazi/out/opened.bin", block = true, desc = "probe" } ]
+
+[open]
+rules = [ { url = "*", use = [ "probe" ] } ]

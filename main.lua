@@ -5,6 +5,22 @@
 
 local M = {}
 
+-- Installed by M:setup (async init.lua context); redraw paths are unreachable
+-- without setup, so direct lazy `@sync entry` actions never see it as nil.
+local render
+
+-- Raw module table for the async rebuild pass, resolved on the first rebuild
+-- from inside the existing async context (same raw-cache pattern as render).
+local rebuild_pass
+
+-- Raw module table for the async create/rename mutation passes, resolved on
+-- first use from inside their existing async contexts (same raw-cache pattern).
+local operations
+
+-- Raw module table for the setup-installed mutation event handlers, resolved
+-- lazily inside the async init.lua context (same raw-cache pattern).
+local events
+
 -- ---------------------------------------------------------------------------
 -- Layout toggles (tree/preview) — unchanged behavior.
 -- ---------------------------------------------------------------------------
@@ -87,62 +103,6 @@ local function apply_active()
 	rt.mgr.ratio = ratio
 	ya.emit("app:resize", {})
 end
-
--- ---------------------------------------------------------------------------
--- Rendering configuration: "lines" (default) or "indent", plus optional
--- equal-width glyph overrides.
--- ---------------------------------------------------------------------------
-
--- Compact forms lead with the indent cell and drop the trailing gap, so the
--- branch sits directly against the file icon while every connector stays three
--- cells wide. Root rows keep the empty prefix and remain flush-left.
-local DEFAULT_GLYPHS = {
-	branch = " ├─",
-	last = " └─",
-	vertical = " │ ",
-	space = "   ",
-}
-
-local render_style = "lines"
-local glyphs = {
-	branch = DEFAULT_GLYPHS.branch,
-	last = DEFAULT_GLYPHS.last,
-	vertical = DEFAULT_GLYPHS.vertical,
-	space = DEFAULT_GLYPHS.space,
-}
-
--- Custom glyphs may keep any width, but they must share one width or the
--- indent and branch columns drift apart. Missing keys fall back to the
--- defaults; an inconsistent or non-string set is ignored wholesale.
-local function resolve_glyphs(overrides)
-	local pick = {}
-	local width
-	for _, name in ipairs({ "branch", "last", "vertical", "space" }) do
-		local value = overrides[name]
-		if value == nil then
-			value = DEFAULT_GLYPHS[name]
-		end
-		if type(value) ~= "string" or value == "" then
-			ya.dbg("[tree-dbg] ignoring glyph overrides: ", name, " is not a non-empty string")
-			return nil
-		end
-		local w = ui.width(value)
-		if width == nil then
-			width = w
-		elseif w ~= width then
-			ya.dbg("[tree-dbg] ignoring glyph overrides: widths differ at ", name)
-			return nil
-		end
-		pick[name] = value
-	end
-	return pick
-end
-
--- Bounded diagnostics: log at most the first custom redraw after each enable.
-local logged_redraw = false
-
--- Original preset renderer, captured once so setup() stays idempotent.
-local saved_redraw
 
 -- Original preset Header.flags, captured once so setup() stays idempotent.
 local saved_header_flags
@@ -328,30 +288,6 @@ local function relative_depth(f, cwd)
 	return depth
 end
 
--- Alphabetical, directories first.
-local function sort_children(files)
-	table.sort(files, function(a, b)
-		local ad = (a.cha and a.cha.is_dir) and true or false
-		local bd = (b.cha and b.cha.is_dir) and true or false
-		if ad ~= bd then
-			return ad
-		end
-		return tostring(a.name) < tostring(b.name)
-	end)
-end
-
--- Smart-case, literal (non-regex) basename substring match. A query holding an
--- uppercase character is case-sensitive, otherwise matching is case-folded.
-local function match_name(name, query)
-	if not query or query == "" then
-		return true
-	end
-	if query:find("%u") then
-		return name:find(query, 1, true) ~= nil
-	end
-	return name:lower():find(query:lower(), 1, true) ~= nil
-end
-
 -- Depth-0 url order as currently displayed; used only to seed M.root_order.
 local function capture_root_order()
 	local order = {}
@@ -359,25 +295,6 @@ local function capture_root_order()
 		order[#order + 1] = tostring(f.url)
 	end
 	return order
-end
-
--- Prefix columns for a row: `depth-1` ancestor cells (vertical or blank, from
--- the continuation flags) plus the row's own branch/last connector. Root rows
--- (depth 0) stay flush-left. `cont[i]` is true when the ancestor at level i has
--- a later sibling, so its column must keep drawing a vertical.
-local function row_prefix(depth, last, cont)
-	if depth <= 0 then
-		return ""
-	end
-	if render_style == "indent" then
-		return string.rep(glyphs.space, depth)
-	end
-	local parts = {}
-	for i = 1, depth - 1 do
-		parts[#parts + 1] = (cont and cont[i]) and glyphs.vertical or glyphs.space
-	end
-	parts[#parts + 1] = last and glyphs.last or glyphs.branch
-	return table.concat(parts)
 end
 
 -- Code-point count without the utf8 library: counts bytes that are not UTF-8
@@ -582,386 +499,27 @@ local function rebuild(gen, focus_str, pin)
 	)
 
 	ya.async(function()
-		local started = ya.time()
-		if not check_gen(gen, tab) then
-			return
+		if not rebuild_pass then
+			require("tree.rebuild") -- async context: safe here
+			-- Raw module table: plain sync entry, no require-proxy wrapper.
+			rebuild_pass = package.loaded["tree.rebuild"]
 		end
-
-		local root_files = fs.read_dir(Url(cwd_str), { resolve = true })
-		if not root_files then
-			ya.dbg("[tree-dbg] async root read failed")
-			finish_rebuild(gen, tab, nil)
-			return
-		end
-
-		local expanded_set = {}
-		for _, u in ipairs(expanded) do
-			expanded_set[u] = true
-		end
-
-		local by_url = {}
-		for _, f in ipairs(root_files) do
-			by_url[tostring(f.url)] = f
-		end
-
-		-- Authoritative root order: keep known roots in place, drop deleted
-		-- ones, then append roots created since the order was captured.
-		local order, seen_order = {}, {}
-		for _, url_str in ipairs(root_order) do
-			if by_url[url_str] and not seen_order[url_str] then
-				seen_order[url_str] = true
-				order[#order + 1] = url_str
-			end
-		end
-		for _, f in ipairs(root_files) do
-			local u = tostring(f.url)
-			if not seen_order[u] then
-				seen_order[u] = true
-				order[#order + 1] = u
-			end
-		end
-
-		-- Lazy, reachability-driven reads: only expanded directories reachable
-		-- from a root are read, so an expanded key under a collapsed ancestor
-		-- costs no I/O. Symlinked/indirect directories are never descended
-		-- (cycle guard); a read failure simply drops that subtree.
-		local function expandable(f)
-			return f.cha and f.cha.is_dir and not f.cha.is_link and not f.cha.is_indirect
-		end
-
-		local kids_by_parent = {}
-		local dirs_read = 0
-
-		local queue, qi = {}, 1
-		for _, f in ipairs(root_files) do
-			if expandable(f) and expanded_set[tostring(f.url)] then
-				queue[#queue + 1] = f
-			end
-		end
-
-		while qi <= #queue do
-			if not check_gen(gen, tab) then
-				return
-			end
-			local f = queue[qi]
-			qi = qi + 1
-			local dir_str = tostring(f.url)
-			local kids = fs.read_dir(Url(dir_str), { resolve = true })
-			dirs_read = dirs_read + 1
-			if kids then
-				sort_children(kids)
-				kids_by_parent[dir_str] = kids
-				for _, k in ipairs(kids) do
-					if expandable(k) and expanded_set[tostring(k.url)] then
-						queue[#queue + 1] = k
-					end
-				end
-			else
-				ya.dbg("[tree-dbg] nested read failed; dir=", dir_str)
-			end
-		end
-
-		if not check_gen(gen, tab) then
-			return
-		end
-
-		-- Hierarchy-aware visibility: a row is kept when its basename matches
-		-- the query or it owns a matching descendant through an expanded
-		-- directory. Unexpanded subtrees stay opaque (lazy expansion).
-		local visible_memo = {}
-		local function is_visible(f)
-			if not filter then
-				return true
-			end
-			local u = tostring(f.url)
-			local v = visible_memo[u]
-			if v ~= nil then
-				return v
-			end
-			if match_name(tostring(f.name), filter) then
-				visible_memo[u] = true
-				return true
-			end
-			local kids = kids_by_parent[u]
-			if kids then
-				for _, k in ipairs(kids) do
-					if is_visible(k) then
-						visible_memo[u] = true
-						return true
-					end
-				end
-			end
-			visible_memo[u] = false
-			return false
-		end
-
-		local all, rows, added = {}, {}, {}
-		local row_count = 0
-
-		local function emit(f, depth, last, cont, parent_str)
-			local u = tostring(f.url)
-			if added[u] then
-				return
-			end
-			added[u] = true
-			all[#all + 1] = f
-			rows[u] = { depth = depth, last = last, cont = cont, parent = parent_str }
-			row_count = row_count + 1
-		end
-
-		-- Pure depth-first flatten over the captured root order. Child order is
-		-- the per-directory dirs-first/alphabetical listing; `cont` carries the
-		-- ancestor continuation flags so connectors stay correct at any depth.
-		local function walk(f, depth, cont)
-			local u = tostring(f.url)
-			local kids = kids_by_parent[u]
-			if not kids then
-				return
-			end
-			local visible = {}
-			for _, k in ipairs(kids) do
-				if is_visible(k) then
-					visible[#visible + 1] = k
-				end
-			end
-			local parent_last = true
-			if rows[u] then
-				parent_last = rows[u].last
-			end
-			for i, k in ipairs(visible) do
-				local k_last = (i == #visible)
-				local k_cont = {}
-				for j = 1, #cont do
-					k_cont[j] = cont[j]
-				end
-				if depth > 0 then
-					k_cont[#k_cont + 1] = not parent_last
-				end
-				emit(k, depth + 1, k_last, k_cont, u)
-				walk(k, depth + 1, k_cont)
-			end
-		end
-
-		for _, url_str in ipairs(order) do
-			local f = by_url[url_str]
-			if f and is_visible(f) then
-				emit(f, 0, true, {}, cwd_str)
-				walk(f, 0, {})
-			end
-		end
-
-		set_root_order(gen, tab, order)
-		set_rows(gen, tab, rows)
-
-		-- Final generation+tab check right before the atomic emit sequence, so
-		-- a stale rebuild cannot reset a folder owned by a newer generation or
-		-- a different tab (update_files is always active-tab-only).
-		if not check_gen(gen, tab) then
-			return
-		end
-
-		ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd_str), files = {} }) })
-		ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd_str), files = all }) })
-		ya.emit("update_files", {
-			op = fs.op("done", {
-				id = ticket,
-				file = File({ url = Url(cwd_str), cha = fs.cha(Url(cwd_str), false) }),
-			}),
+		rebuild_pass.run({
+			gen = gen,
+			tab = tab,
+			cwd_str = cwd_str,
+			expanded = expanded,
+			root_order = root_order,
+			filter = filter,
+			ticket = ticket,
+			injected = injected,
+			focus_str = focus_str,
+			check_gen = check_gen,
+			set_root_order = set_root_order,
+			set_rows = set_rows,
+			finish_rebuild = finish_rebuild,
 		})
-
-		if focus_str then
-			ya.emit("plugin", { "tree", "focus" })
-		end
-
-		ya.dbg(
-			"[tree-dbg] rebuild done gen=",
-			gen,
-			"dirs=",
-			dirs_read,
-			"rows=",
-			row_count,
-			"expanded=",
-			#expanded,
-			"ms=",
-			string.format("%.1f", (ya.time() - started) * 1000)
-		)
-
-		finish_rebuild(gen, tab, injected)
 	end)
-end
-
--- ---------------------------------------------------------------------------
--- Rendering (only Current.redraw is replaced).
--- ---------------------------------------------------------------------------
-
--- Style-field names as they come back from Style:raw(), mapped to the
--- modifier methods used to invert them.
-local MOD_METHODS = {
-	bold = "bold",
-	dim = "dim",
-	italic = "italic",
-	underline = "underline",
-	blink = "blink",
-	blink_rapid = "blink_rapid",
-	reversed = "reverse",
-	hidden = "hidden",
-	crossed = "crossed",
-}
-
--- The outer ui.Line style paints the whole row before spans run (ratatui
--- set_style), so the connector inherits the hover indicator. A span can only
--- set fields, never clear them, so invert exactly the fields the active
--- indicator sets. `style` is th.indicator.current in this pane.
-local function unhighlight(style)
-	local cancel = ui.Style()
-	local raw = style:raw()
-	if raw.fg then
-		cancel = cancel:fg("reset")
-	end
-	if raw.bg then
-		cancel = cancel:bg(App.bg())
-	end
-	for key, method in pairs(MOD_METHODS) do
-		local value = raw[key]
-		if value ~= nil then
-			-- The binding's modifier methods take `remove`: passing true moves
-			-- the modifier into sub_modifier (which Cell::set_style removes),
-			-- so the raw value is exactly the argument that inverts it.
-			cancel = cancel[method](cancel, value)
-		end
-	end
-	return cancel
-end
-
--- Bounded diagnostic: one open-icon log per enable, never per frame.
-local logged_open_icon = false
-
--- Fresh Entity instances are plain tables that can shadow the class method, so
--- an expanded parent can request the theme's hovered-directory icon without
--- touching read-only File.is_hovered or the row's real style.
-local function open_icon(self)
-	local icon = th.icon:match(self._file, { hovered = true })
-	if not icon then
-		return ""
-	elseif self._file.is_hovered then
-		return icon.text .. " "
-	else
-		return ui.Line(icon.text .. " "):style(icon.style)
-	end
-end
-
--- Reproduce preset Current:redraw() from the already-loaded folder window,
--- prefixing every injected descendant (depth > 0) with connectors that stay
--- correct at any depth. Root rows stay flush-left. One ui.Line per item keeps
--- row i aligned with the folder cursor. The connector span cancels the hover
--- indicator; the outer line style still fills the entity region through the
--- right edge exactly like stock.
-local function redraw_tree(self)
-	local folder = self._folder
-	local files = folder.window
-	local cwd = folder.cwd
-	local left, right = {}, {}
-
-	local depths = {}
-	for i = 1, #files do
-		depths[i] = relative_depth(files[i], cwd)
-	end
-
-	-- Fallback metadata for rows absent from the last rebuild snapshot (for
-	-- example a root file that appeared without a rebuild): a forward scan for
-	-- the final sibling plus an ancestor stack reproducing the flatten's
-	-- continuation recurrence.
-	local lasts, conts = {}, {}
-	local anc_last = {}
-	for i = 1, #files do
-		local d = depths[i] or 0
-		local last = true
-		for j = i + 1, #files do
-			local dj = depths[j] or 0
-			if dj < d then
-				break
-			elseif dj == d then
-				last = false
-				break
-			end
-		end
-		lasts[i] = last
-		local cont = {}
-		for level = 1, d - 1 do
-			cont[level] = not anc_last[level]
-		end
-		conts[i] = cont
-		anc_last[d] = last
-	end
-
-	local cancel = unhighlight(th.indicator.current)
-	local open_dirs = {}
-
-	for i, f in ipairs(files) do
-		local meta = M.rows[tostring(f.url)]
-		local depth, last, cont
-		if meta then
-			depth, last, cont = meta.depth, meta.last, meta.cont
-		else
-			depth, last, cont = depths[i] or 0, lasts[i], conts[i]
-		end
-
-		local prefix = row_prefix(depth, last, cont)
-		local pw = ui.width(prefix)
-
-		local entity = Entity:new(f)
-		if f.cha and f.cha.is_dir and M.expanded[tostring(f.url)] then
-			entity.icon = open_icon
-			open_dirs[#open_dirs + 1] = tostring(f.name)
-		end
-
-		local line = ui.Line({ ui.Span(prefix):style(cancel), entity:redraw() }):style(entity:style())
-		left[#left + 1] = line
-		right[#right + 1] = Linemode:new(f):redraw()
-		local max = math.max(0, self._area.w - right[#right]:width())
-		line:truncate({ max = max, ellipsis = entity:ellipsis(math.max(0, max - pw)) })
-	end
-
-	if #open_dirs > 0 and not logged_open_icon then
-		logged_open_icon = true
-		ya.dbg("[tree-dbg] open-folder icon on expanded dirs: ", table.concat(open_dirs, ", "))
-	end
-
-	return {
-		ui.List(left):area(self._area),
-		ui.Text(right):area(self._area):align(ui.Align.RIGHT),
-		table.unpack(Dnd:new(self._area):redraw()),
-	}
-end
-
--- Only Current.redraw is replaced, so every stock Current interaction method
--- (click, scroll, touch, drag, drop, empty) stays intact.
-local function redraw(self)
-	if not active_tree() then
-		return saved_redraw(self)
-	end
-	local files = self._folder and self._folder.window
-	if not files or #files == 0 then
-		return saved_redraw(self)
-	end
-	if not logged_redraw then
-		logged_redraw = true
-		ya.dbg(
-			"[tree-dbg] render style=",
-			render_style,
-			"branch=",
-			glyphs.branch,
-			"last=",
-			glyphs.last,
-			"vertical=",
-			glyphs.vertical,
-			"space=",
-			glyphs.space,
-			"rows=",
-			#files
-		)
-	end
-	return redraw_tree(self)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1197,21 +755,6 @@ end
 -- rename must remap metadata and rebuild before the hierarchy goes stale.
 -- ---------------------------------------------------------------------------
 
-local function same_tab(tab)
-	if tab == nil then
-		return true
-	end
-	local id = cx.active.id
-	if type(id) == "userdata" then
-		id = id.value
-	end
-	return tonumber(tab) == id
-end
-
-local function url_in_subtree(url_str, root_str)
-	return url_str == root_str or url_str:sub(1, #root_str + 1) == root_str .. "/"
-end
-
 -- Absolute-URL re-key for saved per-root state. Unlike remap_expanded_prefix
 -- this never consults the active cwd, so it can address the saved sets of roots
 -- other than the active one. `url_str` outside the moved subtree is unchanged.
@@ -1346,9 +889,11 @@ local function remap_saved_bulk(map)
 	end)
 end
 
+-- Absolute-URL, path-boundary-safe subtree membership. The events module has
+-- its own copy; this one serves prune_saved, which stays behind the controller.
 local function in_any_subtree(url_str, roots)
 	for _, r in ipairs(roots) do
-		if url_in_subtree(url_str, r) then
+		if url_str == r or url_str:sub(1, #r + 1) == r .. "/" then
 			return true
 		end
 	end
@@ -1429,241 +974,6 @@ local function remap_expanded_prefix(from_str, to_str)
 	return #updates > 0
 end
 
--- Apply one (from, to) pair; returns true when the injected hierarchy changes.
-local function rename_one(from_str, to_str)
-	local affected = false
-
-	if M.root_order then
-		for _, u in ipairs(M.root_order) do
-			if u == from_str then
-				affected = true
-				break
-			end
-		end
-	end
-
-	-- A renamed directory moves every expansion keyed below it, not just its
-	-- own key; without this the orphaned descendant keys silently collapse the
-	-- subtree and can resurrect stale expansion if the old URL returns.
-	if remap_expanded_prefix(from_str, to_str) then
-		affected = true
-	end
-
-	-- A rename inside an expanded subtree changes visible child rows even when
-	-- no controlled key itself moved.
-	for root in pairs(M.expanded) do
-		if url_in_subtree(from_str, root) or url_in_subtree(to_str, root) then
-			affected = true
-			break
-		end
-	end
-
-	-- Preserve the renamed root's slot instead of re-deriving order from the
-	-- already-mutated flat folder (which appends the upserted entry).
-	if M.root_order then
-		for i, u in ipairs(M.root_order) do
-			if u == from_str then
-				M.root_order[i] = to_str
-				break
-			end
-		end
-	end
-
-	return affected
-end
-
-local function on_rename(payload)
-	if not payload then
-		return
-	end
-	local from_str = payload.from and tostring(payload.from)
-	local to_str = payload.to and tostring(payload.to)
-	if not from_str or not to_str then
-		return
-	end
-
-	-- Saved per-root state of every tab is re-keyed regardless of which tab is
-	-- active or whether it is in tree mode, so a rename performed from a classic
-	-- tab cannot leave a tree tab's stale expansion keys pointing at the old URL.
-	ya.dbg(
-		"[tree-dbg] rename event from=",
-		from_str,
-		" to=",
-		to_str,
-		" tab=",
-		tostring(payload.tab),
-		" tabs=",
-		count_keys(M.tabs)
-	)
-	local saved_touched = remap_saved(from_str, to_str)
-
-	-- Live-state remap and the follow-up rebuild only apply when this event
-	-- belongs to the active tree tab. `rename` carries the originating tab id.
-	if not active_tree() or not same_tab(payload.tab) then
-		if saved_touched then
-			ya.dbg("[tree-dbg] rename saved-state re-key only; from=", from_str, " to=", to_str)
-		end
-		return
-	end
-	if not rename_one(from_str, to_str) then
-		if saved_touched then
-			ya.dbg("[tree-dbg] rename saved-state re-key; from=", from_str, " to=", to_str)
-		end
-		return
-	end
-	M.gen = M.gen + 1
-	M.pending_focus = to_str
-	ya.dbg("[tree-dbg] rename ", from_str, " -> ", to_str)
-	ui.render()
-	rebuild(M.gen, to_str)
-end
-
-local function on_bulk_rename(payload)
-	if not payload then
-		return
-	end
-
-	-- Build the simultaneous old-to-new map up front. Applying a payload
-	-- pairwise through pairs() is order-dependent: swaps (A->B, B->A) and
-	-- chains (A->B, B->C) would clobber each other's keys mid-iteration.
-	local map = {}
-	for from, to in pairs(payload) do
-		map[tostring(from)] = tostring(to)
-	end
-
-	-- Saved per-root state of every tab is re-keyed against the same untouched
-	-- map, including roots other than the active one, regardless of which tab is
-	-- active or whether it is in tree mode. A bulk rename performed from a
-	-- classic tab must not leave a tree tab's stale expansion keys behind.
-	local saved_touched = remap_saved_bulk(map)
-
-	-- Live-state remap and the follow-up rebuild only apply to the active tree
-	-- tab (bulk-rename carries no tab id, so scope by the active tree mode).
-	if not active_tree() then
-		if saved_touched then
-			ya.dbg("[tree-dbg] bulk-rename saved-state re-key only; pairs=", #map)
-		end
-		return
-	end
-
-	local function remap(url_str)
-		return map[url_str] or url_str
-	end
-
-	-- Destination of one cwd-relative path under the simultaneous map. A
-	-- directory move also carries every path beneath it, so the most specific
-	-- mapped ancestor (longest cwd-relative `from` prefix) wins; resolving each
-	-- original against the untouched map is what keeps swaps/chains
-	-- order-independent.
-	local function remap_rel(rel)
-		local best_from, best_to, best_len
-		for from_str, to_str in pairs(map) do
-			if from_str ~= to_str then
-				local from_rel = rel_of(from_str)
-				local to_rel = rel_of(to_str)
-				if from_rel and to_rel and from_rel ~= "" then
-					local suffix
-					if rel == from_rel then
-						suffix = ""
-					elseif rel:sub(1, #from_rel + 1) == from_rel .. "/" then
-						suffix = rel:sub(#from_rel + 1)
-					end
-					if suffix and (not best_len or #from_rel > best_len) then
-						best_from, best_to, best_len = from_rel, to_rel, #from_rel
-					end
-				end
-			end
-		end
-		if not best_from then
-			return nil
-		end
-		if best_from == rel then
-			return best_to
-		end
-		return best_to .. rel:sub(#best_from + 1)
-	end
-
-	local touched = false
-
-	-- Rebuild the controlled keys from a snapshot of their originals so every
-	-- pair is remapped exactly once, independent of payload order.
-	local expanded = {}
-	for url_str in pairs(M.expanded) do
-		expanded[#expanded + 1] = url_str
-	end
-	local cwd = cx.active.current.cwd
-	local new_expanded = {}
-	for _, url_str in ipairs(expanded) do
-		local to_str = remap(url_str)
-		if to_str == url_str then
-			local rel = rel_of(url_str)
-			local mapped = rel and remap_rel(rel) or nil
-			if mapped then
-				to_str = tostring(cwd:join(mapped))
-			end
-		end
-		new_expanded[to_str] = true
-		if to_str ~= url_str then
-			touched = true
-		end
-	end
-
-	local new_root_order
-	if M.root_order then
-		new_root_order = {}
-		for i, url_str in ipairs(M.root_order) do
-			new_root_order[i] = remap(url_str)
-			if new_root_order[i] ~= url_str then
-				touched = true
-			end
-		end
-	end
-
-	-- A rename inside an expanded subtree changes visible child rows even when
-	-- no controlled key itself moved.
-	if not touched then
-		for from_str, to_str in pairs(map) do
-			for root in pairs(M.expanded) do
-				if url_in_subtree(from_str, root) or url_in_subtree(to_str, root) then
-					touched = true
-					break
-				end
-			end
-			if touched then
-				break
-			end
-		end
-	end
-
-	if not touched then
-		if saved_touched then
-			ya.dbg("[tree-dbg] bulk-rename saved-state re-key only; pairs=", #map)
-		end
-		return
-	end
-
-	-- Deterministic focus: the smallest destination among the moved URLs, so
-	-- the cursor does not depend on pairs() order.
-	local dests = {}
-	for from_str, to_str in pairs(map) do
-		if to_str ~= from_str then
-			dests[#dests + 1] = to_str
-		end
-	end
-	table.sort(dests)
-	local focus = dests[1]
-
-	M.expanded = new_expanded
-	if new_root_order then
-		M.root_order = new_root_order
-	end
-	M.gen = M.gen + 1
-	M.pending_focus = focus
-	ya.dbg("[tree-dbg] bulk-rename applied; pairs=", #dests, " focus=", tostring(focus))
-	ui.render()
-	rebuild(M.gen, focus)
-end
-
 -- Sync-side application of a plugin-owned nested rename. The async input task
 -- cannot touch M or cx, so it hands both the old and the resolved new URL back
 -- here to re-key the expansion subtree (a renamed directory must keep its
@@ -1715,156 +1025,75 @@ local function prune_rows(target_str)
 	return removed
 end
 
--- Nearest surviving ancestor directory of `url_str` inside the tree root. Walks
--- the cwd-relative path upward, skipping any ancestor removed by the same batch,
--- and returns nil for a root row (whose parent is the tree root, not a row). No
--- filesystem access: the event fires after the removal and every ancestor of a
--- removed path is itself a directory unless the same batch removed it.
-local function nearest_surviving_parent(url_str, removed)
-	local cwd = cx.active.current.cwd
-	local cwd_str = tostring(cwd)
-	local rel = rel_of(url_str)
-	local parent_rel = rel and rel:match("^(.*)/[^/]*$") or nil
-	while parent_rel and parent_rel ~= "" do
-		local candidate = tostring(cwd:join(parent_rel))
-		if candidate ~= cwd_str and not removed[candidate] then
-			return candidate
-		end
-		parent_rel = parent_rel:match("^(.*)/[^/]*$")
-	end
-	return nil
+-- ---------------------------------------------------------------------------
+-- Mutation-event domain controller. events.lua owns the rename/remove/transfer
+-- reconciliation policy; every read and write of M stays in main.lua behind
+-- these bounded operations, so the module never holds the state table.
+-- ---------------------------------------------------------------------------
+
+-- True when `url_str` is the active tree root or an expanded directory: the two
+-- places where a created/removed/transferred child becomes a visible row.
+local function is_tree_parent(url_str)
+	return url_str == tostring(cx.active.current.cwd) or M.expanded[url_str]
 end
 
--- Bound handler factory: the two events differ only in their diagnostics label.
-local function make_on_remove(kind)
-	return function(payload)
-		local urls = payload and payload.urls
-		if type(urls) ~= "table" then
-			return
-		end
-
-		local cwd_str = tostring(cx.active.current.cwd)
-		local removed = {}
-		local roots = {}
-		local all_removed = {}
-		local affected = false
-		for _, u in ipairs(urls) do
-			local u_str = tostring(u)
-			all_removed[#all_removed + 1] = u_str
-			local rel = rel_of(u_str)
-			if rel and rel ~= "" then
-				removed[u_str] = true
-				roots[#roots + 1] = u_str
-				local parent = Url(u_str).parent
-				local parent_str = parent and tostring(parent) or ""
-				if active_tree() and (parent_str == cwd_str or M.expanded[parent_str]) then
-					affected = true
-				end
-			end
-		end
-		-- Saved per-root state of every tab is maintained regardless of which
-		-- tab is active or whether it is in tree mode: a removal performed from
-		-- a classic tab must still prune the stale expansion keys of a tree tab,
-		-- or a directory later recreated at the same URL would resurrect them.
-		-- Absolute-URL subtree tests, so roots other than the active one are
-		-- covered too.
-		local saved_touched = prune_saved(all_removed)
-		if not affected then
-			if saved_touched then
-				ya.dbg("[tree-dbg] " .. kind .. " saved-state prune only; urls=" .. #all_removed)
-			end
-			return
-		end
-
-		local pruned_expanded = 0
-		local pruned_rows = 0
-		for _, u_str in ipairs(roots) do
-			if prune_expanded(u_str) then
-				pruned_expanded = pruned_expanded + 1
-			end
-			if prune_rows(u_str) then
-				pruned_rows = pruned_rows + 1
-			end
-		end
-
-		-- Focus anchor. Capture the pre-event hovered URL and the visible row
-		-- order, then anchor: (1) the hovered row when it survives outside every
-		-- removed subtree, (2) its nearest surviving parent row when the hovered
-		-- row was removed, (3) the nearest prior then nearest next surviving
-		-- visible row. Candidates are resolved in order by M:focus, so a
-		-- candidate later hidden by the active tree filter is skipped.
-		local h = hovered()
-		local hovered_str = h and tostring(h.url) or nil
-		local candidates, seen = {}, {}
-		local function add_candidate(u)
-			if u and not seen[u] then
-				seen[u] = true
-				candidates[#candidates + 1] = u
-			end
-		end
-
-		if
-			hovered_str
-			and rel_of(hovered_str)
-			and not in_any_subtree(hovered_str, all_removed)
-		then
-			add_candidate(hovered_str)
-		end
-		if hovered_str then
-			add_candidate(nearest_surviving_parent(hovered_str, removed))
-		end
-
-		local files = cx.active.current.files
-		local idx = 0
-		for i = 1, #files do
-			if hovered_str and tostring(files[i].url) == hovered_str then
-				idx = i
-				break
-			end
-		end
-		if idx == 0 then
-			idx = (cx.active.current.cursor or 0) + 1
-		end
-		local function survivor(u)
-			return rel_of(u) ~= nil and not in_any_subtree(u, all_removed)
-		end
-		for i = idx - 1, 1, -1 do
-			local u = tostring(files[i].url)
-			if survivor(u) then
-				add_candidate(u)
-			end
-		end
-		for i = idx + 1, #files do
-			local u = tostring(files[i].url)
-			if survivor(u) then
-				add_candidate(u)
-			end
-		end
-
-		local focus = #candidates > 0 and candidates or nil
-
-		M.gen = M.gen + 1
-		M.pending_focus = focus
-		ya.dbg(
-			"[tree-dbg] "
-				.. kind
-				.. " event urls="
-				.. #roots
-				.. " pruned_expanded="
-				.. pruned_expanded
-				.. " pruned_rows="
-				.. pruned_rows
-				.. " focus="
-				.. tostring(focus and focus[1])
-		)
-		ui.render()
-		rebuild(M.gen, focus)
+-- Snapshot of the controlled expansion keys. The module rebuilds whole sets, so
+-- it reads a plain list and hands the replacement back through commit_mutation.
+local function expanded_keys()
+	local out = {}
+	for url_str in pairs(M.expanded) do
+		out[#out + 1] = url_str
 	end
+	return out
+end
+
+-- Snapshot of the depth-0 URL order (nil when the plugin has none yet).
+local function root_order_snapshot()
+	local order = M.root_order
+	if not order then
+		return nil
+	end
+	local out = {}
+	for i, url_str in ipairs(order) do
+		out[i] = url_str
+	end
+	return out
+end
+
+-- Prune the controlled hierarchy for every removed root and report how many
+-- expansion keys and visible-row entries were dropped.
+local function prune_for_removal(roots)
+	local pruned_expanded, pruned_rows = 0, 0
+	for _, u_str in ipairs(roots) do
+		if prune_expanded(u_str) then
+			pruned_expanded = pruned_expanded + 1
+		end
+		if prune_rows(u_str) then
+			pruned_rows = pruned_rows + 1
+		end
+	end
+	return pruned_expanded, pruned_rows
+end
+
+-- Single commit for every mutation handler: install the replacement sets when
+-- the module computed them, bump the generation, request the focus, then redraw
+-- and coalesce one controlled rebuild. Preserves the existing update order.
+local function commit_mutation(focus, new_expanded, new_root_order)
+	if new_expanded then
+		M.expanded = new_expanded
+	end
+	if new_root_order then
+		M.root_order = new_root_order
+	end
+	M.gen = M.gen + 1
+	M.pending_focus = focus
+	ui.render()
+	rebuild(M.gen, focus)
 end
 
 -- r: tree-aware rename. Outside tree mode, for a depth-0 row, or with a native
 -- multi-selection this delegates to stock rename (which routes selections to
--- bulk rename, already remapped by on_bulk_rename). Delegation forwards the
+-- bulk rename, already remapped by the events module). Delegation forwards the
 -- stock preset binding's `cursor = "before_ext"` so caret placement there is
 -- unchanged. A single injected descendant at any depth is renamed beside its
 -- parent by the plugin, without stock `reveal` rerooting the tab onto the child
@@ -1903,79 +1132,17 @@ function M:rename()
 	ya.dbg("[tree-dbg] nested rename open; old=", old_url_str, "move=", tostring(move))
 
 	ya.async(function()
-		-- Re-derive URLs from captured strings; the File userdata is scoped to
-		-- the sync context and must not be held across the async task.
-		local old_url = Url(old_url_str)
-		local parent = old_url.parent
-
-		-- A realtime input returns immediately, so the input layer's own
-		-- `input:move` action can place the caret before the extension (the
-		-- stock `before_ext` placement) while the popup is already shown.
-		local stream = ya.input({
-			title = "Rename:",
-			value = name,
-			-- Stock rename position (hovered, offset [0, 1, 50, 3]).
-			pos = { "hovered", y = 1, w = 50 },
-			realtime = true,
+		if not operations then
+			require("tree.operations") -- async context: safe here
+			-- Raw module table: plain call, no require-proxy wrapper.
+			operations = package.loaded["tree.operations"]
+		end
+		operations.nested_rename({
+			old_url_str = old_url_str,
+			name = name,
+			move = move,
+			apply_nested_rename = apply_nested_rename,
 		})
-		if move then
-			ya.emit("input:move", { move })
-		end
-
-		local value, event = stream:recv()
-		while event == 3 do
-			value, event = stream:recv()
-		end
-		-- Cancellation is a no-op, matching stock rename.
-		if event ~= 1 then
-			ya.dbg("[tree-dbg] nested rename cancelled; event=", tostring(event))
-			return
-		end
-		if value == nil or value == "" then
-			return
-		end
-
-		if not parent then
-			ya.dbg("[tree-dbg] nested rename has no parent; old=", old_url_str)
-			return
-		end
-		local new_url = parent:join(value)
-		local new_url_str = tostring(new_url)
-		if new_url_str == old_url_str then
-			return
-		end
-
-		-- Ask before replacing an existing sibling. The plugin cannot run the
-		-- casefold engine, so the exact same-path check above is the only
-		-- implicit no-op; every other existing destination prompts.
-		local cha = fs.cha(new_url, false)
-		if cha then
-			ya.dbg("[tree-dbg] nested rename overwrite prompt; new=", new_url_str)
-			local ok = ya.confirm({
-				pos = { "center", w = 60, h = 10 },
-				title = "Overwrite?",
-				body = "`" .. new_url_str .. "` already exists",
-			})
-			if not ok then
-				ya.dbg("[tree-dbg] nested rename overwrite declined; new=", new_url_str)
-				return
-			end
-		end
-
-		local renamed, err = fs.rename(old_url, new_url)
-		if not renamed then
-			ya.dbg("[tree-dbg] nested rename failed; old=", old_url_str, " err=", tostring(err))
-			ya.notify({
-				title = "Rename failed",
-				content = string.format("Failed to rename `%s`: %s", old_url_str, tostring(err)),
-				level = "error",
-				timeout = 5,
-			})
-			return
-		end
-
-		ya.dbg("[tree-dbg] nested rename ", old_url_str, " -> ", new_url_str)
-		apply_nested_rename(old_url_str, new_url_str)
 	end)
 end
 
@@ -2158,87 +1325,17 @@ function M:create(args)
 
 	ya.dbg("[tree-dbg] create target=", target_str, " force=", tostring(force))
 	ya.async(function()
-		local value, event = ya.input({
-			name = "create-file",
-			title = "Create:",
-			history = "shared",
-			-- Stock create popup (top-center, offset [0, 2, 50, 3]).
-			pos = { "top-center", y = 2, w = 50 },
+		if not operations then
+			require("tree.operations") -- async context: safe here
+			-- Raw module table: plain call, no require-proxy wrapper.
+			operations = package.loaded["tree.operations"]
+		end
+		operations.create({
+			force = force,
+			target_str = target_str,
+			cwd_str = cwd_str,
+			create_after = create_after,
 		})
-		if event ~= 1 or value == nil or value == "" then
-			ya.dbg("[tree-dbg] create cancelled; event=", tostring(event))
-			return
-		end
-
-		local last = value:sub(-1)
-		local is_dir = last == "/" or last == "\\"
-		local name = value
-		if is_dir then
-			name = value:sub(1, -2)
-		end
-		if name == "" then
-			return
-		end
-
-		local joined = Url(target_str):join(name)
-		local joined_str = tostring(joined)
-
-		if is_dir then
-			local ok, err = fs.create("dir_all", joined)
-			if not ok then
-				ya.dbg("[tree-dbg] create dir failed; url=", joined_str, " err=", tostring(err))
-				ya.notify({ title = "Create failed", content = tostring(err), level = "error", timeout = 3 })
-				return
-			end
-		else
-			local parent = joined.parent
-			if parent then
-				fs.create("dir_all", parent)
-			end
-			local cha = fs.cha(joined, false)
-			if cha and cha.is_dir then
-				-- A directory can never be replaced by an empty file; fail
-				-- cleanly instead of prompting and then hitting EISDIR.
-				ya.dbg("[tree-dbg] create dir collision; url=", joined_str)
-				ya.notify({
-					title = "Create failed",
-					content = "`" .. joined_str .. "` already exists as a directory",
-					level = "error",
-					timeout = 3,
-				})
-				return
-			end
-			if cha then
-				if not force then
-					local ok = ya.confirm({
-						pos = { "center", w = 60, h = 10 },
-						title = "Overwrite file?",
-						body = "`" .. joined_str .. "` already exists",
-					})
-					if not ok then
-						ya.dbg("[tree-dbg] create overwrite declined; url=", joined_str)
-						return
-					end
-				end
-				if cha.is_link then
-					-- fs.write would follow the link and truncate its target;
-					-- unlink the link itself (a hard unlink, never the trash).
-					fs.remove("file", joined)
-				end
-				-- A regular file needs no unlink: fs.write opens with
-				-- create+truncate, so overwriting stays in place with no
-				-- missing-path window and no lost inode.
-			end
-			local ok, err = fs.write(joined, "")
-			if not ok then
-				ya.dbg("[tree-dbg] create write failed; url=", joined_str, " err=", tostring(err))
-				ya.notify({ title = "Create failed", content = tostring(err), level = "error", timeout = 3 })
-				return
-			end
-		end
-
-		ya.dbg("[tree-dbg] create done; url=", joined_str, " is_dir=", tostring(is_dir))
-		create_after(cwd_str, target_str, joined_str)
 	end)
 end
 
@@ -2249,67 +1346,6 @@ end
 -- scheduler keeps unique-name/force behavior, task progress, hooks, watcher
 -- reports, and duplicate/move DDS events identical to stock.
 -- ---------------------------------------------------------------------------
-
--- Successful copy/move completion for an expanded (or cwd) branch: rebuild so
--- new children appear under their parent and moved-away rows disappear.
---
--- A move also removes the source path from the filesystem, so every tab's saved
--- roots are pruned for the moved-away `from` URLs regardless of the active tab's
--- mode; a duplicate only adds a destination and never invalidates saved state.
-local function make_on_transfer(kind)
-	return function(payload)
-		local items = payload and payload.items
-		if type(items) ~= "table" then
-			return
-		end
-
-		-- Move: drop saved roots/expansion keys under every moved-away source,
-		-- for every tab, before any active-tab routing.
-		if kind == "move" then
-			local froms = {}
-			for _, item in ipairs(items) do
-				if item.from then
-					froms[#froms + 1] = tostring(item.from)
-				end
-			end
-			if prune_saved(froms) then
-				ya.dbg("[tree-dbg] move saved-state prune; froms=", #froms)
-			end
-		end
-
-		if not active_tree() then
-			return
-		end
-
-		local cwd_str = tostring(cx.active.current.cwd)
-		local affected = false
-		for _, item in ipairs(items) do
-			for _, key in ipairs({ "from", "to" }) do
-				local u = item[key]
-				if u then
-					local parent = Url(tostring(u)).parent
-					local parent_str = parent and tostring(parent) or ""
-					if parent_str == cwd_str or M.expanded[parent_str] then
-						affected = true
-					end
-				end
-			end
-			if affected then
-				break
-			end
-		end
-		if not affected then
-			return
-		end
-
-		M.gen = M.gen + 1
-		local h = hovered()
-		local focus = h and tostring(h.url) or nil
-		ya.dbg("[tree-dbg] transfer complete; kind=", kind, " items=", #items)
-		ui.render()
-		rebuild(M.gen, focus)
-	end
-end
 
 -- p / P: paste into the hovered tree level. A cwd destination (root-level file,
 -- or no hover) delegates to stock paste for exact parity; otherwise every
@@ -2707,23 +1743,34 @@ end
 function M:setup(opts)
 	opts = opts or {}
 
-	render_style = opts.style == "indent" and "indent" or "lines"
-	if type(opts.glyphs) == "table" then
-		local resolved = resolve_glyphs(opts.glyphs)
-		if resolved then
-			glyphs = resolved
-		end
+	if not render then
+		require(".render") -- runs in init.lua's async context
+		-- Raw module table: plain sync functions, no per-row require proxy.
+		render = package.loaded["tree.render"]
 	end
+	render.configure(opts)
+
 	if opts.filter_mode == "suspend" or opts.filter_mode == "clear" then
 		filter_mode = opts.filter_mode
 	else
 		filter_mode = "adopt"
 	end
-	ya.dbg("[tree-dbg] setup; style=", render_style, " filter_mode=", filter_mode)
+	ya.dbg("[tree-dbg] setup; style=", render.style(), " filter_mode=", filter_mode)
 
-	if not saved_redraw then
-		saved_redraw = Current.redraw
-		Current.redraw = redraw
+	if
+		render.install({
+			saved = Current.redraw,
+			active_tree = active_tree,
+			relative_depth = relative_depth,
+			rows = function()
+				return M.rows
+			end,
+			expanded = function()
+				return M.expanded
+			end,
+		})
+	then
+		Current.redraw = render.redraw
 	end
 
 	install_header_filter()
@@ -2748,11 +1795,40 @@ function M:setup(opts)
 		ps.sub("tab", on_tab)
 	end
 
+	-- Setup-installed mutation event reconciliation. events.lua owns the
+	-- rename/bulk-rename and remove/transfer policy; the bounded controller
+	-- keeps every read and write of M in main.lua.
+	if not events then
+		require(".events") -- runs in init.lua's async context
+		-- Raw module table: plain sync handlers, no per-event require proxy.
+		events = package.loaded["tree.events"]
+	end
+	local mutation = events.bind({
+		active_tree = active_tree,
+		hovered = hovered,
+		rel_of = rel_of,
+		cwd = function()
+			return cx.active.current.cwd
+		end,
+		is_tree_parent = is_tree_parent,
+		count_keys_tabs = function()
+			return count_keys(M.tabs)
+		end,
+		remap_saved = remap_saved,
+		remap_saved_bulk = remap_saved_bulk,
+		remap_expanded_prefix = remap_expanded_prefix,
+		expanded_keys = expanded_keys,
+		root_order = root_order_snapshot,
+		prune_saved = prune_saved,
+		prune_for_removal = prune_for_removal,
+		commit_mutation = commit_mutation,
+	})
+
 	-- Remap/rebuild the injected hierarchy when rows are renamed.
 	if not mutate_subscribed then
 		mutate_subscribed = true
-		ps.sub("rename", on_rename)
-		ps.sub("bulk-rename", on_bulk_rename)
+		ps.sub("rename", mutation.on_rename)
+		ps.sub("bulk-rename", mutation.on_bulk_rename)
 	end
 
 	-- Sort is transformed and hidden changes are re-asserted after the actor,
@@ -2766,16 +1842,16 @@ function M:setup(opts)
 	-- Successful copy/move completion: refresh the affected injected branches.
 	if not transfer_subscribed then
 		transfer_subscribed = true
-		ps.sub("duplicate", make_on_transfer("duplicate"))
-		ps.sub("move", make_on_transfer("move"))
+		ps.sub("duplicate", mutation.on_transfer("duplicate"))
+		ps.sub("move", mutation.on_transfer("move"))
 	end
 
 	-- Successful trash/permanent-delete completion: prune every removed URL
 	-- and subtree from the controlled hierarchy and coalesce one rebuild.
 	if not remove_subscribed then
 		remove_subscribed = true
-		ps.sub("trash", make_on_remove("trash"))
-		ps.sub("delete", make_on_remove("delete"))
+		ps.sub("trash", mutation.on_remove("trash"))
+		ps.sub("delete", mutation.on_remove("delete"))
 	end
 
 	-- Optional per-launch startup state. setup() runs during init.lua, before
@@ -2788,8 +1864,7 @@ function M:setup(opts)
 			tree = startup.tree == true,
 			preview = startup.preview ~= false,
 		}
-		logged_redraw = false
-		logged_open_icon = false
+		render.reset_logs()
 		ya.dbg(
 			"[tree-dbg] startup tree=",
 			tostring(startup_defaults.tree),
@@ -2807,8 +1882,9 @@ function M:toggle()
 		return
 	end
 	sync_base()
-	logged_redraw = false
-	logged_open_icon = false
+	if render then
+		render.reset_logs()
+	end
 
 	if t.tree then
 		-- Turning tree mode OFF for this tab only. Collapse everything by

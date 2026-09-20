@@ -631,6 +631,30 @@ actually read and `rows` is the number of injected rows. A rebuild that is
 discarded as stale returns before emitting and does not log the completion
 line.
 
+## Testing
+
+The integration harness in `tests/` drives the plugin through a private tmux
+server and an isolated Yazi config, so it never touches your real config,
+fixtures, or tmux sessions. It requires Bash, `yazi` 26.9.1, and `tmux`.
+
+```sh
+./tests/integration.sh                 # run every scenario
+./tests/integration.sh startup filter  # run only the named scenarios
+./tests/integration.sh --list          # list available scenario names
+./tests/integration.sh --jobs 4        # run selected scenarios 4 at a time
+```
+
+`--jobs N` runs each selected scenario in its own child process, at most `N` at
+a time, collecting per-job logs and exit codes under the temporary root and
+replaying failures in scenario order. It requires Bash 5.1 or newer (for
+`wait -n -p`); serial runs work on older Bash.
+
+Environment variables:
+
+- `TREE_IT_ROOT` — base directory for temporary state (default
+  `/tmp/opencode/tree-it`).
+- `TREE_IT_KEEP=1` — keep the temporary root even on success, for debugging.
+
 ## License
 
 This plugin is MIT-licensed. For more information check the [LICENSE](LICENSE)

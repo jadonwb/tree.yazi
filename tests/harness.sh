@@ -330,15 +330,31 @@ make_fixture_search() {
 	printf 'NOPE' >"$FIXTURE/plain/p.txt"
 }
 
+# Deterministic no-op block editor for stock bulk rename: records the temp list
+# it is handed into $DIR/selected.txt and exits 0, so bulk rename sees no name
+# changes and returns without prompting. Used to observe that stock bulk rename
+# ran without depending on the host's vi.
+make_noop_editor() {
+	cat >"$DIR/editor.sh" <<SH
+#!/bin/sh
+cp "\$1" "$DIR/selected.txt"
+exit 0
+SH
+	chmod +x "$DIR/editor.sh"
+}
+
 # ---------------------------------------------------------------------------
 # tmux driving
 # ---------------------------------------------------------------------------
 
+# launch <cwd> [extra env assignments]. The optional extra_env string is
+# inserted into the tmux `env ...` command, so callers pass e.g.
+# "EDITOR='$DIR/editor.sh'" to inject a deterministic editor.
 launch() {
-	local cwd="$1"
+	local cwd="$1" extra_env="${2:-}"
 	SESSION="t-${STAMP}-$((RANDOM))"
 	tmux -L "$SOCK" -u new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS" \
-		"env YAZI_CONFIG_HOME='$CFG' XDG_STATE_HOME='$STATE' XDG_RUNTIME_DIR='$RUN' YAZI_LOG=debug yazi --cwd-file='$CWD_FILE' '$cwd'"
+		"env YAZI_CONFIG_HOME='$CFG' XDG_STATE_HOME='$STATE' XDG_RUNTIME_DIR='$RUN' YAZI_LOG=debug $extra_env yazi --cwd-file='$CWD_FILE' '$cwd'"
 	wait_ready
 }
 
@@ -436,6 +452,7 @@ _w_header_has() { capture | head -n 1 | grep -qF -- "$1"; }
 _w_header_lacks() { ! capture | head -n 1 | grep -qF -- "$1"; }
 _w_line_has() { capture | tail -n 1 | grep -qF -- "$1"; }
 _w_log_has() { grep -qE -- "$1" "$LOG"; }
+_w_file_exists() { [ -e "$1" ]; }
 
 wait_pane_has() {
 	_wait_for "$((${2:-15} * 10))" _w_pane_has "$1" ||
@@ -471,6 +488,13 @@ wait_line() {
 wait_log_has() {
 	_wait_for "$((${1:-15} * 10))" _w_log_has "$2" ||
 		fail "${3:-log should match within ${1:-15}s} /$2/"
+	return 0
+}
+
+# Bounded wait for a filesystem path (file_exists would fail on first miss).
+wait_file_exists() {
+	_wait_for "$((${2:-15} * 10))" _w_file_exists "$1" ||
+		fail "${3:-file should exist within ${2:-15}s} '$1'"
 	return 0
 }
 

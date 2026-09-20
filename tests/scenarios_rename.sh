@@ -397,3 +397,79 @@ scenario_rename_root_roundtrip() {
 	assert_log_clean
 	stop_session
 }
+
+# Visual selection rename: v then r on an injected nested row must delegate to
+# stock bulk rename immediately. Yazi only commits the visual range into
+# cx.active.selected inside its own Rename actor (escape_visual), so the plugin
+# has to detect the active mode itself; otherwise the nested row falls through
+# to the plugin-owned single-file prompt.
+scenario_rename_visual() {
+	new_env rename_visual
+	write_config true adopt
+	make_fixture
+	make_noop_editor
+	launch "$FIXTURE" "EDITOR='$DIR/editor.sh'"
+
+	send_key l
+	settle 0.9
+	send_key j
+	settle 0.4
+	hovered_is 'child.txt' "nested cursor before the visual rename"
+
+	# Start a visual range on the injected child and extend it over the next
+	# DFS row (aa.txt); then r must reach stock bulk rename, not the plugin.
+	send_key v
+	settle 0.3
+	send_key j
+	settle 0.3
+	send_key r
+
+	# The stock editor runs asynchronously; wait for it to record the list.
+	wait_file_exists "$DIR/selected.txt" 15 "stock bulk rename should open the editor"
+	pane_lacks 'Rename:' "visual rename must not open the single-file popup"
+	log_lacks 'nested rename open' "visual rename must not use the plugin-owned path"
+	# Membership only: selection order is an IndexMap, not stable.
+	grep -qF 'alpha/child.txt' "$DIR/selected.txt" ||
+		fail "bulk list should contain alpha/child.txt"
+	grep -qF 'aa.txt' "$DIR/selected.txt" ||
+		fail "bulk list should contain aa.txt"
+
+	snapshot rename_visual
+	assert_log_clean
+	stop_session
+}
+
+# Committed (Space) selection on nested rows keeps delegating through the
+# pre-existing `#cx.active.selected > 0` branch the fix extends.
+scenario_rename_selected_committed() {
+	new_env rename_selected_committed
+	write_config true adopt
+	make_fixture
+	make_noop_editor
+	launch "$FIXTURE" "EDITOR='$DIR/editor.sh'"
+
+	send_key l
+	settle 0.9
+	send_key j
+	settle 0.4
+	hovered_is 'child.txt'
+	# Space toggles selection and advances the cursor one row each time, so two
+	# presses select the injected child and the following root file.
+	send_key Space
+	settle 0.4
+	send_key Space
+	settle 0.4
+
+	send_key r
+	wait_file_exists "$DIR/selected.txt" 15 "committed selection should bulk rename"
+	pane_lacks 'Rename:' "committed selection must not open the single-file popup"
+	log_lacks 'nested rename open' "committed selection must not use the plugin-owned path"
+	grep -qF 'alpha/child.txt' "$DIR/selected.txt" ||
+		fail "bulk list should contain alpha/child.txt"
+	grep -qF 'aa.txt' "$DIR/selected.txt" ||
+		fail "bulk list should contain aa.txt"
+
+	snapshot rename_selected_committed
+	assert_log_clean
+	stop_session
+}

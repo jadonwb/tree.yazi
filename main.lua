@@ -1126,15 +1126,18 @@ local function commit_mutation(focus, new_expanded, new_root_order)
 	rebuild(M.gen, focus)
 end
 
--- r: tree-aware rename. Outside tree mode, for a depth-0 row, or with a native
--- multi-selection this delegates to stock rename (which routes selections to
--- bulk rename, already remapped by the events module). Delegation forwards the
--- stock preset binding's `cursor = "before_ext"` so caret placement there is
--- unchanged. A single injected descendant at any depth is renamed beside its
--- parent by the plugin, without stock `reveal` rerooting the tab onto the child
--- path; its caret reproduces `before_ext` by opening a realtime input and
--- emitting the input layer's own `move` offset. Casefold handling remains the
--- only stock capability the plugin-owned path cannot run.
+-- r: tree-aware rename. Outside tree mode, for a depth-0 row, with a native
+-- multi-selection, or during an active visual range this delegates to stock
+-- rename (which routes selections to bulk rename, already remapped by the
+-- events module). A visual range is not written to `cx.active.selected` until
+-- stock's own Rename actor commits it (`escape_visual`), so it must be detected
+-- through `cx.active.mode` and delegated before the nested-row decision.
+-- Delegation forwards the stock preset binding's `cursor = "before_ext"` so
+-- caret placement there is unchanged. A single injected descendant at any depth
+-- is renamed beside its parent by the plugin, without stock `reveal` rerooting
+-- the tab onto the child path; its caret reproduces `before_ext` by opening a
+-- realtime input and emitting the input layer's own `move` offset. Casefold
+-- handling remains the only stock capability the plugin-owned path cannot run.
 function M:rename()
 	if not active_tree() then
 		ya.emit("rename", { cursor = "before_ext" })
@@ -1147,8 +1150,11 @@ function M:rename()
 		return
 	end
 
-	-- Stock rename hands any non-empty selection to bulk rename.
-	if #cx.active.selected > 0 then
+	-- Stock rename hands any non-empty selection to bulk rename. An in-progress
+	-- visual range has not been committed to `selected` yet (stock's Rename actor
+	-- runs escape_visual itself), so any non-normal manager mode must delegate
+	-- immediately or a nested row would fall through to the plugin-owned path.
+	if #cx.active.selected > 0 or (cx.active.mode and not cx.active.mode.is_normal) then
 		ya.emit("rename", { cursor = "before_ext" })
 		return
 	end

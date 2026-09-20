@@ -57,6 +57,8 @@ SCENARIOS=(
 	rename_deep
 	rename_dir_deep
 	overwrite
+	rename_visual
+	rename_selected_committed
 	create
 	create_overwrite
 	create_collisions

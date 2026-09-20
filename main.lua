@@ -35,10 +35,28 @@ local function tab_state(id)
 	return M.tabs[id or M.active_tab]
 end
 
+-- Native fd/rg provider View. Yazi cds the tab to a `fd://`/`rg://` URL and
+-- streams provider results as the Folder, so every tree path (renderer, actions,
+-- events) must delegate to stock behavior there: the provider rows, stock `f`
+-- filtering, and stock EscapeView (which cds back to the physical root) all
+-- stay untouched. Recognized purely from a cwd scheme.
+local function is_search_url(url_str)
+	return url_str:sub(1, 5) == "fd://" or url_str:sub(1, 5) == "rg://"
+end
+
+local function native_search_view()
+	return is_search_url(tostring(cx.active.current.cwd))
+end
+
 -- Renderer/header/action routing authority. Before any lifecycle handler has
 -- observed a tab (the very first frame of a startup launch) fall back to the
--- configured startup default so the first paint is already tree-shaped.
+-- configured startup default so the first paint is already tree-shaped. A
+-- native search View is never a tree View, regardless of the tab's recorded
+-- mode, so it delegates to stock Yazi everywhere.
 local function active_tree()
+	if native_search_view() then
+		return false
+	end
 	local t = tab_state()
 	if t then
 		return t.tree == true
@@ -215,6 +233,9 @@ local function pin_sort_for(t)
 	if not t or t.sort_saved then
 		return
 	end
+	if native_search_view() then
+		return
+	end
 	t.sort_saved = capture_sort()
 	ya.dbg("[tree-dbg] pinning sort_by=none (was ", tostring(t.sort_saved.by), ")")
 	ya.emit("sort", { by = "none" })
@@ -223,6 +244,9 @@ end
 -- Restore a tab's configured sort preferences when it leaves tree mode.
 local function restore_sort_for(t)
 	if not t or not t.sort_saved then
+		return
+	end
+	if native_search_view() then
 		return
 	end
 	local s = t.sort_saved
@@ -441,6 +465,12 @@ end)
 local function rebuild(gen, focus_str, pin)
 	local tab = M.active_tab or active_id()
 	if not tab then
+		return
+	end
+	-- The provider owns a native search View's Folder: never read it back into
+	-- the injected hierarchy or reset it (which would wipe the streamed rows).
+	if native_search_view() then
+		ya.dbg("[tree-dbg] rebuild skipped; native search view")
 		return
 	end
 	M.active_tab = tab
@@ -714,6 +744,11 @@ end
 -- expansions exist the existing generation-checked rebuild validates the keys
 -- and rereads disk (so `h`/`l` never observe expanded rows with an empty state).
 local function reconcile_root()
+	-- A native provider View must never be stripped or rehydrated: its rows are
+	-- the provider's stream, not the plugin's injected hierarchy.
+	if native_search_view() then
+		return
+	end
 	M.pending_focus = nil
 	local exp, has = next(M.expanded) ~= nil, has_descendants()
 	if has and not exp then
@@ -1635,6 +1670,18 @@ local function activate(tab)
 		return
 	end
 	local root = tostring(cx.active.current.cwd)
+	if native_search_view() then
+		-- Activating a tab whose Folder is a native provider View: keep the
+		-- provider rows intact. The tab's recorded root stays the provider URL
+		-- and its saved physical state stays in t.roots; only the layout is
+		-- re-applied, and reconcile_root is skipped entirely.
+		t.root = root
+		M.pending_focus, M.injected, M.injecting = nil, false, false
+		load_roots(t, root)
+		apply_active()
+		prune_tabs()
+		return
+	end
 	t.root = root
 	M.pending_focus, M.injected, M.injecting = nil, false, false
 	if t.tree then
@@ -1687,17 +1734,58 @@ local function on_cd(payload)
 		return
 	end
 
+	if native_search_view() then
+		-- cd into a native fd/rg View: delegate the provider Folder entirely.
+		-- Save the outgoing physical root's live state (t.root is still the
+		-- physical root), advance the tab's recorded root to the provider URL so
+		-- returning to the physical root is a real reroot that restores the
+		-- saved hierarchy, and drop the live working set without touching the
+		-- Folder (no strip, rehydrate, or rebuild).
+		if t.tree then
+			save_live(tab)
+		end
+		M.gen = M.gen + 1
+		M.active_tab = tab
+		t.root = root
+		t.suspended_filter = nil
+		M.pending_focus, M.injected, M.injecting = nil, false, false
+		M.expanded, M.rows = {}, {}
+		M.root_order, M.filter_query = nil, nil
+		ya.dbg(
+			"[tree-dbg] cd search view; tab=",
+			tab,
+			" root=",
+			root,
+			" tree=",
+			tostring(t.tree)
+		)
+		return
+	end
+
 	-- save_live still sees the outgoing root here: Yazi's Folder swap does not
 	-- touch Lua state and on_cd is the first callback after it.
 	if t.tree then
 		save_live(tab)
 	end
+	-- A cd back from a native search View applies the mode that was recorded
+	-- while the View was active: the sort pin (tree on) or configured-sort
+	-- restore (tree off) was deferred because the provider Folder must not be
+	-- reordered. Ordinary cds keep the baseline pin/restore timing (activate or
+	-- toggle), so the initial folder load is untouched.
+	local from_search_view = t.root ~= nil and is_search_url(t.root)
 	M.gen = M.gen + 1
 	M.active_tab = tab
 	t.root = root
 	-- Never restore a saved native query across a cd/reroot: it belongs to the
 	-- folder that owned it, and the new Folder may carry its own filter.
 	t.suspended_filter = nil
+	if from_search_view then
+		if t.tree then
+			pin_sort_for(t)
+		else
+			restore_sort_for(t)
+		end
+	end
 	load_roots(t, root)
 	M.pending_focus, M.injected, M.injecting = nil, false, false
 	ya.dbg(
@@ -1884,6 +1972,22 @@ function M:toggle()
 	sync_base()
 	if render then
 		render.reset_logs()
+	end
+
+	if native_search_view() then
+		-- Toggling tree mode inside a native fd/rg View only records the tab's
+		-- desired mode and reflows the layout; sort pin/restore and root
+		-- reconciliation are deferred until the next physical cd applies them,
+		-- so the provider Folder is never mutated.
+		t.tree = not t.tree
+		ya.dbg(
+			"[tree-dbg] toggle in search view; tab=",
+			M.active_tab,
+			" recorded tree=",
+			tostring(t.tree)
+		)
+		apply_active()
+		return
 	end
 
 	if t.tree then

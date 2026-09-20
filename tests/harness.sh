@@ -52,8 +52,13 @@ new_env() {
 	ln -sfn "$PLUGIN_DIR" "$CFG/plugins/tree.yazi"
 }
 
+# Extra values for the optional third argument: "search" omits the `s`/`S` sort
+# bindings entirely so Yazi's preset `search --via=fd` / `--via=rg` bindings
+# apply (a user prepend of the same action does not open the search input on
+# this build). write_config_search is the named wrapper; every existing
+# two-argument call keeps the sort bindings.
 write_config() {
-	local tree="$1" mode="$2"
+	local tree="$1" mode="$2" search="${3:-}"
 	cat >"$CFG/init.lua" <<LUA
 require("tree"):setup({
 	filter_mode = "$mode",
@@ -115,6 +120,10 @@ run = "plugin tree escape"
 on = "r"
 run = "plugin tree rename"
 
+TOML
+	if [ "$search" != "search" ]; then
+		cat >>"$CFG/keymap.toml" <<'TOML'
+
 [[mgr.prepend_keymap]]
 on = "s"
 run = "sort size --reverse=no"
@@ -122,6 +131,9 @@ run = "sort size --reverse=no"
 [[mgr.prepend_keymap]]
 on = "S"
 run = "sort mtime --reverse=no"
+TOML
+	fi
+	cat >>"$CFG/keymap.toml" <<'TOML'
 
 # Close the second tab by index (0-based) while another tab stays active, so a
 # background tab close can be exercised.
@@ -129,6 +141,11 @@ run = "sort mtime --reverse=no"
 on = "X"
 run = "tab_close 1"
 TOML
+}
+
+# Search-view config: native fd/rg search bindings instead of the sort bindings.
+write_config_search() {
+	write_config "$1" "$2" search
 }
 
 # Extra keymaps for the per-root/tab persistence scenarios. `dest0` and `dest9`
@@ -298,6 +315,21 @@ make_fixture_back_forward() {
 	printf 'B1' >"$FIXTURE/Bmore/bdir/b1.txt"
 }
 
+# search fixture: six .txt files (three nested under alpha/) where only three
+# contain NEEDLE, so fd (name match `txt`) and rg (content match `NEEDLE`) return
+# different result sets. fd txt -> 6 rows (4 carry a path separator); rg NEEDLE
+# -> 3 rows (2 carry a path separator).
+make_fixture_search() {
+	rm -rf "$FIXTURE"
+	mkdir -p "$FIXTURE/alpha/beta/gamma" "$FIXTURE/plain"
+	printf 'NEEDLE' >"$FIXTURE/top.txt"
+	printf 'NEEDLE' >"$FIXTURE/alpha/a.txt"
+	printf 'NEEDLE' >"$FIXTURE/alpha/beta/b.txt"
+	printf 'NOPE' >"$FIXTURE/alpha/beta/gamma/c.txt"
+	printf 'NOPE' >"$FIXTURE/other.txt"
+	printf 'NOPE' >"$FIXTURE/plain/p.txt"
+}
+
 # ---------------------------------------------------------------------------
 # tmux driving
 # ---------------------------------------------------------------------------
@@ -376,6 +408,72 @@ capture() {
 	tmux -L "$SOCK" capture-pane -p -t "$SESSION"
 }
 
+# ---------------------------------------------------------------------------
+# Bounded waits
+#
+# fd/rg streaming and the plugin's cd/rebuild callbacks are asynchronous, so a
+# single capture is racy. Wait helpers poll one condition every 0.1s until a
+# timeout (default 15s) and then fail (fail already dumps the pane and log).
+# ---------------------------------------------------------------------------
+
+# Poll a predicate until it passes or the try budget runs out.
+_wait_for() {
+	local tries="$1"; shift
+	local i=0
+	while [ "$i" -lt "$tries" ]; do
+		if "$@"; then
+			return 0
+		fi
+		sleep 0.1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+_w_pane_has() { capture | grep -qF -- "$1"; }
+_w_pane_lacks() { ! capture | grep -qF -- "$1"; }
+_w_header_has() { capture | head -n 1 | grep -qF -- "$1"; }
+_w_header_lacks() { ! capture | head -n 1 | grep -qF -- "$1"; }
+_w_line_has() { capture | tail -n 1 | grep -qF -- "$1"; }
+_w_log_has() { grep -qE -- "$1" "$LOG"; }
+
+wait_pane_has() {
+	_wait_for "$((${2:-15} * 10))" _w_pane_has "$1" ||
+		fail "${3:-pane should contain within ${2:-15}s} '$1'"
+	return 0
+}
+
+wait_pane_lacks() {
+	_wait_for "$((${2:-15} * 10))" _w_pane_lacks "$1" ||
+		fail "${3:-pane should not contain within ${2:-15}s} '$1'"
+	return 0
+}
+
+wait_header_has() {
+	_wait_for "$((${2:-15} * 10))" _w_header_has "$1" ||
+		fail "${3:-header should contain within ${2:-15}s} '$1'"
+	return 0
+}
+
+wait_header_lacks() {
+	_wait_for "$((${2:-15} * 10))" _w_header_lacks "$1" ||
+		fail "${3:-header should not contain within ${2:-15}s} '$1'"
+	return 0
+}
+
+# Wait for the status line (last pane row) to contain a literal like '1/6'.
+wait_line() {
+	_wait_for "$((${1:-15} * 10))" _w_line_has "$2" ||
+		fail "${3:-status line should contain within ${1:-15}s} '$2'"
+	return 0
+}
+
+wait_log_has() {
+	_wait_for "$((${1:-15} * 10))" _w_log_has "$2" ||
+		fail "${3:-log should match within ${1:-15}s} /$2/"
+	return 0
+}
+
 stop_session() {
 	[ -n "$SESSION" ] || return 0
 	tmux -L "$SOCK" kill-session -t "$SESSION" >/dev/null 2>&1 || true
@@ -408,6 +506,23 @@ pane_has() {
 pane_lacks() {
 	if capture | grep -qF -- "$1"; then
 		fail "${2:-pane should not contain} '$1'"
+	fi
+	return 0
+}
+
+# ERE assertion over the whole pane, for cases a literal cannot express (for
+# example a connector glyph and a result row on the same line).
+pane_matches() {
+	if capture | grep -qE -- "$1"; then
+		return 0
+	fi
+	fail "${2:-pane should match} /$1/"
+}
+
+# Negative ERE assertion over the whole pane.
+pane_lacks_re() {
+	if capture | grep -qE -- "$1"; then
+		fail "${2:-pane should not match} /$1/"
 	fi
 	return 0
 }
@@ -529,6 +644,44 @@ last_rebuild_has() {
 		return 0
 	fi
 	fail "last rebuild line '$line' should match /$1/"
+}
+
+# Count log lines matching an ERE (0 when none, so it is safe under set -e).
+log_count() {
+	grep -acE -- "$1" "$LOG" || true
+}
+
+rebuild_count() {
+	log_count 'rebuild gen='
+}
+
+# Root recorded by the most recent `cd restore` debug line. ya.dbg renders the
+# ` root=` label and the value as separate quoted arguments, so the value sits
+# between `root=" "` and the next `"`.
+last_cd_root() {
+	grep -a 'cd restore' "$LOG" | tail -n 1 | sed -n 's/.*root=" *"\([^"]*\)".*/\1/p'
+}
+
+# Count of `cd search view` debug lines: one per real provider-view entry, so an
+# identical re-run (which Yazi's Cd actor short-circuits) adds none.
+search_view_count() {
+	log_count 'cd search view'
+}
+
+# Root recorded by the most recent `cd search view` debug line.
+last_search_view_root() {
+	grep -a 'cd search view' "$LOG" | tail -n 1 | sed -n 's/.*root=" *"\([^"]*\)".*/\1/p'
+}
+
+# Root in effect at the most recent rebuild: the last `cd restore` at or before
+# the final `rebuild gen=` line (rebuild itself never logs its cwd).
+last_rebuild_root() {
+	local rline cline
+	rline="$(grep -an 'rebuild gen=' "$LOG" | tail -n 1 | cut -d: -f1)"
+	[ -n "$rline" ] || return 0
+	cline="$(head -n "$rline" "$LOG" | grep -a 'cd restore' | tail -n 1)"
+	[ -n "$cline" ] || return 0
+	printf '%s' "$cline" | sed -n 's/.*root=" *"\([^"]*\)".*/\1/p'
 }
 
 # Reject WARN/ERROR level lines and Lua/plugin failures. Command/status noise

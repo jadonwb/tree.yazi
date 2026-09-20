@@ -94,6 +94,13 @@ SCENARIOS=(
 	rename_root_roundtrip
 	remove_root_while_away
 	startup_tracking_clean
+	search_fd_tree
+	search_fd_classic
+	search_rg_tree
+	search_rg_classic
+	search_rerun
+	search_stock_filter
+	search_toggle_defer
 	cleanup
 )
 
@@ -134,6 +141,9 @@ CWD_FILE=""
 
 # Tab-local scenario suite (tab mode/preview/state, cross-tab saved-state, tab close).
 . "$HERE/scenarios_tabs.sh"
+
+# Search-view suite: native fd/rg Views in tree and classic tabs (cd/rebuild/render).
+. "$HERE/scenarios_search.sh"
 
 # ---------------------------------------------------------------------------
 # Entry point

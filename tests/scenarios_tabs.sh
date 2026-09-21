@@ -6,6 +6,15 @@
 # Sourced by integration.sh after harness.sh; definitions only (never executed).
 # ---------------------------------------------------------------------------
 
+# Whitespace-joined left-to-right pane order of the given names, ordered by each
+# name's first rendered line.
+pane_order() {
+	local f
+	for f in "$@"; do
+		printf '%s %s\n' "$(line_of "$f")" "$f"
+	done | sort -n | awk '{print $2}' | paste -sd' ' -
+}
+
 # Tree mode is fully tab-local: toggling one tab does not change the other, and
 # a classic tab must never render injected descendants restored from its cached
 # Folder.
@@ -346,6 +355,172 @@ scenario_tab_sort_local() {
 	log_has 'restoring sort_by=.*size' "tab1 restores size"
 
 	snapshot tab_sort_local
+	assert_log_clean
+	stop_session
+}
+
+# The captured sort preference drives the emulated per-directory order while
+# the native sorter stays pinned to none: a `key-sort` request reorders the live
+# tree immediately, nested children and depth-0 roots alike.
+#
+# Stock `--reverse=no` means ascending, so `S` (mtime) puts the older entry
+# first and `s` (size) puts the smaller entry first.
+scenario_sort_live_mtime() {
+	new_env sort_live_mtime
+	write_config true adopt
+	make_fixture_sort_live
+	launch "$FIXTURE"
+
+	# Expand alpha so its children are injected.
+	hovered_is 'alpha'
+	send_key l
+	settle 1.0
+	pane_has 'anew.txt'
+	pane_has 'zold.txt'
+
+	# Default (alphabetical) order: anew before zold; zbig before zsmall.
+	line_before 'anew.txt' 'zold.txt'
+	line_before 'zbig.txt' 'zsmall.txt'
+
+	# `S` requests mtime (--reverse=no): the older nested file moves ahead.
+	send_key S
+	settle 1.0
+	log_has 'sort request captured; forcing by=none'
+	line_before 'zold.txt' 'anew.txt' "mtime sort reorders injected children live"
+
+	# `s` requests size (--reverse=no): the smaller root file moves ahead.
+	send_key s
+	settle 1.0
+	line_before 'zsmall.txt' 'zbig.txt' "size sort reorders depth-0 roots live"
+
+	snapshot sort_live_mtime
+	assert_log_clean
+	stop_session
+}
+
+# Natural sort is emulated like the other `by` values: three same-parent
+# siblings whose bytewise alphabetical order (file1, file10, file2) differs
+# from the natural order (file1, file2, file10), so a `sort natural` request
+# reorders the live roots. A scenario-local keymap issues the request instead
+# of relying on the stock `,n` chord.
+scenario_sort_live_natural() {
+	new_env sort_live_natural
+	write_config true adopt
+	printf '1' >"$FIXTURE/file1.txt"
+	printf '2' >"$FIXTURE/file2.txt"
+	printf '10' >"$FIXTURE/file10.txt"
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "n"
+run = "sort natural --reverse=no"
+TOML
+	launch "$FIXTURE"
+
+	# Default (alphabetical) order is bytewise: file1, file10, file2.
+	line_before 'file1.txt' 'file10.txt' "alphabetical order before natural sort"
+	line_before 'file10.txt' 'file2.txt' "alphabetical order before natural sort"
+
+	# `n` requests natural (--reverse=no): file1, file2, file10.
+	send_key n
+	settle 1.0
+	log_has 'sort request captured; forcing by=none'
+	line_before 'file1.txt' 'file2.txt' "natural sort reorders depth-0 roots live"
+	line_before 'file2.txt' 'file10.txt' "natural sort reorders depth-0 roots live"
+
+	snapshot sort_live_natural
+	assert_log_clean
+	stop_session
+}
+
+# Random sort is emulated with a per-tab seed: a `sort random` request leaves the
+# alphabetical baseline, later rebuilds (a hidden-toggle reassert) keep that
+# exact order because the seed is frozen, and a second random request advances
+# the seed. A scenario-local keymap issues the request instead of the stock `,r`.
+scenario_sort_live_random() {
+	new_env sort_live_random
+	write_config true adopt
+	printf 'A' >"$FIXTURE/a.txt"
+	printf 'B' >"$FIXTURE/b.txt"
+	printf 'C' >"$FIXTURE/c.txt"
+	printf 'D' >"$FIXTURE/d.txt"
+	printf 'E' >"$FIXTURE/e.txt"
+	printf 'F' >"$FIXTURE/f.txt"
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "R"
+run = "sort random --reverse=no"
+TOML
+	add_hidden_keymap
+	launch "$FIXTURE"
+
+	local files="a.txt b.txt c.txt d.txt e.txt f.txt"
+	local alphabetical="a.txt b.txt c.txt d.txt e.txt f.txt"
+	local order
+	order="$(pane_order $files)"
+	[ "$order" = "$alphabetical" ] || fail "baseline order is '$order', expected '$alphabetical'"
+
+	# `R` requests random: the sibling order leaves the alphabetical baseline.
+	send_key R
+	settle 1.0
+	log_has 'sort request captured; forcing by=none'
+	log_has 'random seed='
+	order="$(pane_order $files)"
+	[ "$order" != "$alphabetical" ] || fail "random sort still matched the alphabetical baseline"
+
+	# A rebuild must keep the frozen order: a hidden toggle queues a reassert.
+	send_key C-h
+	settle 1.2
+	local frozen
+	frozen="$(pane_order $files)"
+	[ "$frozen" = "$order" ] || fail "reassert reshuffled the frozen random order: '$frozen' vs '$order'"
+	send_key C-h
+	settle 1.2
+	frozen="$(pane_order $files)"
+	[ "$frozen" = "$order" ] || fail "second reassert reshuffled the frozen random order"
+
+	# A second random request bumps the seed.
+	send_key R
+	settle 1.0
+	local seeds
+	seeds="$(grep -aoE 'random seed=.*' "$LOG" | grep -oE '[0-9]+$' | paste -sd' ' -)"
+	[ "$seeds" = "1 2" ] || fail "random seed sequence is '$seeds', expected '1 2'"
+
+	snapshot sort_live_random
+	assert_log_clean
+	stop_session
+}
+
+# Natural sort honours the captured `translit` preference: the folded name
+# (École -> Ecole) sorts between Apple and Zebra, where the raw byte order puts
+# the accented name last. A scenario-local keymap issues the translit request.
+scenario_sort_live_translit() {
+	new_env sort_live_translit
+	write_config true adopt
+	printf 'A' >"$FIXTURE/Apple.txt"
+	printf 'Z' >"$FIXTURE/Zebra.txt"
+	printf 'E' >"$FIXTURE/École.txt"
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "n"
+run = "sort natural --translit=yes --reverse=no"
+TOML
+	launch "$FIXTURE"
+
+	# Without translit the accented name sorts last (raw byte order).
+	line_before 'Apple.txt' 'Zebra.txt'
+	line_before 'Zebra.txt' 'École.txt' "byte order puts the accented name last"
+
+	# `n` requests natural with translit: the folded name moves between A and Z.
+	send_key n
+	settle 1.0
+	log_has 'sort request captured; forcing by=none'
+	line_before 'Apple.txt' 'École.txt' "transliterated natural order"
+	line_before 'École.txt' 'Zebra.txt' "transliterated natural order"
+
+	snapshot sort_live_translit
 	assert_log_clean
 	stop_session
 }

@@ -22,15 +22,17 @@ function M.run(ctx)
 	local tab = ctx.tab
 	local cwd_str = ctx.cwd_str
 	local expanded = ctx.expanded
-	local root_order = ctx.root_order
 	local filter = ctx.filter
+	local sort_pref = ctx.sort
 	local show_hidden = ctx.show_hidden
 	local ticket = ctx.ticket
 	local injected = ctx.injected
 	local focus_str = ctx.focus_str
+	local hovered_url = ctx.hovered_url
 	local check_gen = ctx.check_gen
 	local set_root_order = ctx.set_root_order
 	local set_rows = ctx.set_rows
+	local set_injected_files = ctx.set_injected_files
 	local set_expanded = ctx.set_expanded
 	local set_hidden_roots = ctx.set_hidden_roots
 	local finish_rebuild = ctx.finish_rebuild
@@ -57,21 +59,14 @@ function M.run(ctx)
 		by_url[tostring(f.url)] = f
 	end
 
-	-- Authoritative root order: keep known roots in place, drop deleted
-	-- ones, then append roots created since the order was captured.
-	local order, seen_order = {}, {}
-	for _, url_str in ipairs(root_order) do
-		if by_url[url_str] and not seen_order[url_str] then
-			seen_order[url_str] = true
-			order[#order + 1] = url_str
-		end
-	end
+	-- Depth-0 roots in the tab's captured sort order. The pinned `none` sorter
+	-- never reorders, so the plugin emulates the preference here per rebuild;
+	-- roots created since the last pass land in sorted position rather than
+	-- being appended.
+	sort_children(root_files, sort_pref)
+	local order = {}
 	for _, f in ipairs(root_files) do
-		local u = tostring(f.url)
-		if not seen_order[u] then
-			seen_order[u] = true
-			order[#order + 1] = u
-		end
+		order[#order + 1] = tostring(f.url)
 	end
 
 	-- Lazy, reachability-driven reads: only expanded directories reachable
@@ -118,7 +113,7 @@ function M.run(ctx)
 		local kids = fs.read_dir(Url(dir_str), { resolve = true })
 		dirs_read = dirs_read + 1
 		if kids then
-			sort_children(kids)
+			sort_children(kids, sort_pref)
 			kids_by_parent[dir_str] = kids
 			for _, k in ipairs(kids) do
 				if expandable(k) and expanded_set[tostring(k.url)] then
@@ -192,9 +187,10 @@ function M.run(ctx)
 		row_count = row_count + 1
 	end
 
-	-- Pure depth-first flatten over the captured root order. Child order is
-	-- the per-directory dirs-first/alphabetical listing; `cont` carries the
-	-- ancestor continuation flags so connectors stay correct at any depth.
+	-- Pure depth-first flatten over the sorted root list. Child order is the
+	-- per-directory preference-aware listing (dirs first, then the captured
+	-- sort); `cont` carries the ancestor continuation flags so connectors stay
+	-- correct at any depth.
 	local function walk(f, depth, cont)
 		local u = tostring(f.url)
 		local kids = kids_by_parent[u]
@@ -267,6 +263,81 @@ function M.run(ctx)
 	if not check_gen(gen, tab) then
 		return
 	end
+
+	-- Publish the replay stash before `all`'s File userdata are consumed by the
+	-- emit below. Only cross-context-safe values are stashed: the URL and the
+	-- link target as strings, and each Stat as a plain table of its public
+	-- fields (Stat userdata and Path userdata cannot cross the sync bridge, and
+	-- File(table) would consume a Path userdata on the first replay anyway).
+	local function stat_snapshot(s)
+		if not s then
+			return nil
+		end
+		-- Reconstruct StatKind from the public predicates: FOLLOW for a followed
+		-- link (an orphan's stat keeps its link mode, a resolved link's stat does
+		-- not; an unfollowed lstat is neither), HIDDEN, DUMMY, and REPARSE for a
+		-- non-link indirect entry.
+		local kind = 0
+		local link_mode = math.floor(s.mode / 4096) % 16 == 10 -- StatMode.T_LINK
+		local follow
+		if link_mode then
+			follow = s.is_orphan
+		else
+			follow = s.is_link
+		end
+		if follow then
+			kind = kind + 1 -- StatKind.FOLLOW
+		end
+		if s.is_hidden then
+			kind = kind + 2 -- StatKind.HIDDEN
+		end
+		if s.is_dummy then
+			kind = kind + 8 -- StatKind.DUMMY
+		end
+		if s.is_indirect and not s.is_link then
+			kind = kind + 16 -- StatKind.REPARSE
+		end
+		return {
+			kind = kind,
+			mode = s.mode,
+			len = s.len,
+			atime = s.atime,
+			btime = s.btime,
+			ctime = s.ctime,
+			mtime = s.mtime,
+			dev = s.dev,
+			uid = s.uid,
+			gid = s.gid,
+			nlink = s.nlink,
+		}
+	end
+
+	local snapshot = {}
+	for i = 1, #all do
+		local f = all[i]
+		snapshot[i] = {
+			url = tostring(f.url),
+			stat = stat_snapshot(f.stat),
+			lstat = stat_snapshot(f.lstat),
+			link_to = f.link_to and tostring(f.link_to) or nil,
+		}
+	end
+
+	-- Whether the emitted set carries any descendant row (depth > 0), read from
+	-- the flatten metadata built in this same pass. The Full-load replay only
+	-- repairs a dropped tree when the recorded injection actually had
+	-- descendants; an expanded-but-empty, hidden, or filtered state records
+	-- none, so on_load must not replay it (which would loop).
+	local has_descendants = false
+	for i = 1, #all do
+		local meta = rows[tostring(all[i].url)]
+		if meta and meta.depth > 0 then
+			has_descendants = true
+			break
+		end
+	end
+
+	set_injected_files(gen, tab, cwd_str, snapshot, hovered_url, has_descendants)
 
 	ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd_str), files = {} }) })
 	ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd_str), files = all }) })

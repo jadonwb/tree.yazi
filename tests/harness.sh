@@ -351,6 +351,22 @@ make_fixture_cd() {
 	printf 'ZZ' >"$FIXTURE/zz.txt"
 }
 
+# Live-sort fixture: root zsmall.txt (1 byte) and zbig.txt (7 bytes) of
+# distinct sizes, plus an expanded alpha/ with anew.txt (newer mtime) and
+# zold.txt (older mtime). Default alphabetical order is anew-before-zold within
+# alpha and zbig-before-zsmall at the root, so a preference-driven reorder is
+# observable in both directions.
+make_fixture_sort_live() {
+	rm -rf "$FIXTURE"
+	mkdir -p "$FIXTURE/alpha"
+	printf 'A' >"$FIXTURE/zsmall.txt"
+	printf 'BIGDATA' >"$FIXTURE/zbig.txt"
+	printf 'OLD' >"$FIXTURE/alpha/zold.txt"
+	printf 'NEWNEWNEW' >"$FIXTURE/alpha/anew.txt"
+	touch -d '2020-01-01 00:00:00' "$FIXTURE/alpha/zold.txt"
+	touch -d '2024-01-01 00:00:00' "$FIXTURE/alpha/anew.txt"
+}
+
 # reroot fixture: alpha/sub_a/a.txt, alpha/leaf_a.txt, beta/sub_b/b.txt,
 # beta/leaf_b.txt.
 make_fixture_reroot_roundtrip() {

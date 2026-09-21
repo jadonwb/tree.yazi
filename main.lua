@@ -101,6 +101,11 @@ M.gen = 0 -- generation, bumped by every sync user action
 M.pending_focus = nil -- URL string (or ordered candidate list) to reposition onto
 M.injected = false -- whether the last completed rebuild injected descendants
 M.injecting = false -- a rebuild is scheduled or in flight (not yet completed)
+M.inject_snapshot = nil -- plain-table replay stash of the last injected rows
+M.inject_cwd = nil -- root URL the replay stash was built for
+M.inject_tab = nil -- tab id the replay stash was published for
+M.inject_has_descendants = nil -- whether the replay stash contained depth>0 rows
+M.last_hovered = nil -- URL last seen hovered by the poll scope
 M.root_order = nil -- authoritative depth-0 URL order (kept across rebuilds/rename)
 M.filter_query = nil -- active hierarchy-aware tree filter query; nil shows every row
 M.dir_sig = {} -- url -> { mtime, is_dir, dev, btime }: last successful expanded-dir metadata
@@ -116,7 +121,7 @@ M.poller_token = nil -- identity of the loop M.poller currently refers to
 -- and `update_files` always targets the active tab, so the plugin must save the
 -- outgoing tab itself and reconcile the incoming one against its saved set.
 M.active_tab = nil -- numeric id of the tab M.expanded/M.rows describe
-M.tabs = {} -- [tab_id] = { tree, preview, sort_saved, suspended_filter, root, roots }
+M.tabs = {} -- [tab_id] = { tree, preview, sort_saved, suspended_filter, random_seed, root, roots }; replay stash on M is tab-gated (inject_snapshot/inject_cwd/inject_tab)
 -- roots[root_url] = { expanded=set, order=list|nil, filter=string|nil }
 
 -- Tab ids arrive either as a Lua number or a userdata Id wrapper, from
@@ -169,6 +174,7 @@ local mutate_subscribed = false
 local preflight_subscribed = false
 local transfer_subscribed = false
 local remove_subscribed = false
+local load_subscribed = false
 
 -- Preflight `key-sort`: while the active tab is in tree mode the flat Entries
 -- list must stay unsorted or the injected hierarchy interleaves. Record what the
@@ -185,6 +191,12 @@ local function on_key_sort(form)
 	if not t.sort_saved then
 		t.sort_saved = layout.capture_sort()
 	end
+	-- Every explicit random request reshuffles by advancing this tab's frozen
+	-- seed; the emulated comparator reads it from the SortForm copy.
+	if form.by == "random" then
+		t.random_seed = (t.random_seed or 0) + 1
+		ya.dbg("[tree-dbg] random seed=", t.random_seed)
+	end
 	for _, field in ipairs(layout.SORT_FIELDS) do
 		if form[field] ~= nil then
 			t.sort_saved[field] = form[field]
@@ -192,6 +204,10 @@ local function on_key_sort(form)
 	end
 	form.by = "none"
 	ya.dbg("[tree-dbg] sort request captured; forcing by=none")
+	-- Re-emulate the captured sort immediately, exactly like the hidden
+	-- toggle: the queued reassert bumps the generation and rebuilds the
+	-- controlled order with the new preference.
+	ya.emit("plugin", { "tree", "reassert" })
 	return form
 end
 
@@ -204,6 +220,99 @@ local function on_key_hidden(form)
 	ya.dbg("[tree-dbg] hidden toggle; scheduling reassert")
 	ya.emit("plugin", { "tree", "reassert" })
 	return form
+end
+
+-- Post-load repair for a native Full reload. Yazi replaces the cwd Folder's
+-- entries wholesale on a Full load (window focus after an external save marks
+-- the folder stale, `refresh`/Ctrl+R, a re-entered root), and because tree mode
+-- pins the tab's sort to `none` the reload lists raw read_dir order with the
+-- injected descendants gone. The DDS `load` event fires after that swap (and
+-- after the plugin's own Part/Done), so re-emit the recorded hierarchy once a
+-- load lands on the current root with no descendants left. The previous rebuild
+-- publishes a plain-table stash (set_injected_files) precisely so this repair is
+-- synchronous and the flat `sort=none` listing is never painted; fresh File
+-- userdata are rebuilt from the stash (File(table) does not consume it) under a
+-- new ticket, the prior hover is re-arrowed, and the async reassert is still
+-- queued to refresh metadata. When no usable stash exists, fall back to the
+-- queued reassert. Guards: only while tree mode is on, nothing is injecting, and
+-- at least one expansion is recorded; the replay additionally requires a stash
+-- that recorded descendants, so a hidden/filtered/empty expansion cannot loop
+-- on the load the replay itself publishes.
+local function on_load(body)
+	if not active_tree() or M.injecting then
+		return
+	end
+	if next(M.expanded) == nil then
+		return
+	end
+	local url = body and body.url
+	if not url or tostring(url) ~= tostring(cx.active.current.cwd) then
+		return
+	end
+	if rows.has_descendants() then
+		return
+	end
+
+	local cwd = tostring(cx.active.current.cwd)
+	local snapshot = M.inject_snapshot
+	if snapshot == nil or M.inject_cwd ~= cwd or M.inject_tab ~= active_id() then
+		ya.dbg("[tree-dbg] full load without descendants; scheduling reassert")
+		ya.emit("plugin", { "tree", "reassert" })
+		return
+	end
+
+	-- Only replay when the recorded injection actually carried descendant rows.
+	-- The plugin's own Part/Done publishes `load`, and a state whose injected
+	-- set legitimately has no depth>0 rows (expanded-but-empty, hidden, or
+	-- filtered subtree) would otherwise replay forever; returning makes that
+	-- `load` a no-op. A genuine Full that ate a tree always has depth>0 rows in
+	-- the stash.
+	if M.inject_has_descendants ~= true then
+		return
+	end
+
+	-- A fresh ticket above the current entries.ticket() is required or
+	-- Folder::update drops the replay's Part/Done.
+	local ticket = M.seq
+	M.seq = M.seq + 1
+	local hover = M.last_hovered
+	local files = {}
+	for i, t in ipairs(snapshot) do
+		-- Rebuild fresh File userdata from the plain-table stash: Stat from the
+		-- serialized fields, the link target from its string, and the URL from
+		-- its string. None of these consume the stash, so repeated replays work.
+		local link_to
+		if t.link_to then
+			local ok, p = pcall(Path.os, t.link_to)
+			link_to = ok and p or nil
+		end
+		files[i] = File({
+			url = t.url,
+			stat = t.stat and Stat(t.stat) or nil,
+			lstat = t.lstat and Stat(t.lstat) or nil,
+			link_to = link_to,
+		})
+	end
+	ya.dbg("[tree-dbg] full load replay; ticket=", ticket, "rows=", #files, "hover=", tostring(hover))
+
+	M.injecting = true
+	ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd), files = {} }) })
+	ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd), files = files }) })
+	ya.emit("update_files", {
+		op = fs.op("done", {
+			-- The live root File is already re-stat'ed by the Full load that
+			-- dropped the rows; re-stat'ing here would need an async call.
+			id = ticket,
+			file = cx.active.current.file,
+		}),
+	})
+	M.injecting = false
+
+	-- Re-arrow to the row hovered before the reload, then rebuild asynchronously
+	-- to refresh metadata and re-anchor the cursor.
+	M.pending_focus = hover
+	ya.emit("plugin", { "tree", "focus" })
+	ya.emit("plugin", { "tree", "reassert" })
 end
 
 -- ---------------------------------------------------------------------------
@@ -338,6 +447,24 @@ local set_rows = ya.sync(function(_, gen, tab, rows)
 	end
 end)
 
+-- Publish the plain-table replay stash a completed rebuild captured before its
+-- File userdata were consumed by the injection. `snapshot` is a list of
+-- { url, stat, lstat, link_to } tables and `hovered_url` the row hovered when
+-- the rebuild entered, used by the native Full-load repair to re-emit the rows
+-- synchronously without a filesystem read. `has_descendants` records whether
+-- that emitted set contained any depth>0 row, so `on_load` only replays a
+-- genuinely dropped tree. Same generation/tab gate as set_rows, so a superseded
+-- rebuild cannot publish a stale stash.
+local set_injected_files = ya.sync(function(_, gen, tab, cwd, snapshot, hovered_url, has_descendants)
+	if M.gen == gen and M.active_tab == tab then
+		M.inject_snapshot = snapshot
+		M.inject_cwd = cwd
+		M.inject_tab = tab
+		M.last_hovered = hovered_url
+		M.inject_has_descendants = has_descendants == true
+	end
+end)
+
 -- Reconcile the live expansion set with what a completed rebuild actually
 -- reached. A key whose chain of expanded ancestors no longer leads to it is
 -- stale, so it is dropped here: the old URL becomes a tombstone and a directory
@@ -406,6 +533,19 @@ local function rebuild(gen, focus_str, pin)
 	if pin ~= false then
 		layout.pin_sort_for(tab_state(tab))
 	end
+	-- The captured SortForm drives the emulated per-directory ordering; nil is
+	-- fine (flatten falls back to alphabetical with directories first).
+	local sort_pref = layout.copy_sort((tab_state(tab) or {}).sort_saved)
+	-- The emulated random order reads a frozen per-tab seed off this copy; the
+	-- seed lives on the tab record (not in SortForm) so the copy/restore
+	-- handoff never emits it. A configured `by = "random"` initializes it once.
+	local sort_t = tab_state(tab)
+	if sort_t and sort_pref then
+		if sort_t.random_seed == nil and sort_pref.by == "random" then
+			sort_t.random_seed = 1
+		end
+		sort_pref.random_seed = sort_t.random_seed
+	end
 
 	-- Take ownership of any native filter before reading the visible set: it
 	-- must stay off for the whole injected-tree lifetime, or injected rows get
@@ -413,6 +553,11 @@ local function rebuild(gen, focus_str, pin)
 	capture_native_filter()
 
 	local cwd_str = tostring(cx.active.current.cwd)
+	-- Capture the hovered row as the rebuild enters so the Full-load repair can
+	-- restore it: by the time a Full load lands the Folder cursor has been reset
+	-- to the raw first row, so the live hover is no longer the user's.
+	local h = cx.active.current.hovered
+	local hovered_url = h and tostring(h.url) or nil
 	-- Per-tab live show-hidden state. `on_key_hidden` queues this rebuild behind
 	-- the Hidden actor, so the value read here is the post-toggle state.
 	local show_hidden = cx.active.pref.show_hidden
@@ -472,13 +617,16 @@ local function rebuild(gen, focus_str, pin)
 			expanded = expanded,
 			root_order = root_order,
 			filter = filter,
+			sort = sort_pref,
 			show_hidden = show_hidden,
 			ticket = ticket,
 			injected = injected,
 			focus_str = focus_str,
+			hovered_url = hovered_url,
 			check_gen = check_gen,
 			set_root_order = set_root_order,
 			set_rows = set_rows,
+			set_injected_files = set_injected_files,
 			set_expanded = set_expanded,
 			set_hidden_roots = set_hidden_roots,
 			finish_rebuild = finish_rebuild,
@@ -741,6 +889,9 @@ local poll_scope = ya.sync(function(_, token)
 		end
 	end
 	local h = hovered()
+	-- Track the hovered row each tick so the native Full-load repair can restore
+	-- the cursor the user last had, even if it moved since the last rebuild.
+	M.last_hovered = h and tostring(h.url) or nil
 	-- The one nested file the poll watches for content-only writes: the hovered
 	-- visible injected regular file (depth > 0). Root-level writes are already
 	-- covered by Yazi's own watcher, and a directory preview is limited to
@@ -1459,8 +1610,9 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Seed a newly observed tab. Tabs created by tab_create inherit the creating
--- tab's tree/preview modes (and its configured sort, because Yazi cloned the
--- creator's pref including a pinned sort_by=none). Boot tabs the plugin sees for
+-- tab's tree/preview modes and, when the creator is a tree tab with a saved
+-- sort, its captured sort; a tab created with an explicit target keeps its
+-- configured sort until the rebuild re-pins it. Boot tabs the plugin sees for
 -- the first time start from the configured startup defaults.
 local function ensure_tab(id, creator)
 	if not id then
@@ -1530,6 +1682,8 @@ local function activate(tab)
 		-- re-applied, and reconcile_root is skipped entirely.
 		t.root = root
 		M.pending_focus, M.injected, M.injecting = nil, false, false
+		M.inject_snapshot = nil
+		M.inject_has_descendants = nil
 		roots.load_roots(t, root)
 		stop_poller()
 		layout.apply_active()
@@ -1538,6 +1692,8 @@ local function activate(tab)
 	end
 	t.root = root
 	M.pending_focus, M.injected, M.injecting = nil, false, false
+	M.inject_snapshot = nil
+	M.inject_has_descendants = nil
 	if t.tree then
 		-- A fresh tree tab has no saved root entry yet, so its folder is still
 		-- loading. Pinning `none` now would force the first loaded frame to raw
@@ -1617,6 +1773,8 @@ local function on_cd(payload)
 		t.root = root
 		t.suspended_filter = nil
 		M.pending_focus, M.injected, M.injecting = nil, false, false
+		M.inject_snapshot = nil
+		M.inject_has_descendants = nil
 		M.expanded, M.rows = {}, {}
 		M.root_order, M.filter_query = nil, nil
 		ya.dbg(
@@ -1657,6 +1815,8 @@ local function on_cd(payload)
 	end
 	roots.load_roots(t, root)
 	M.pending_focus, M.injected, M.injecting = nil, false, false
+	M.inject_snapshot = nil
+	M.inject_has_descendants = nil
 	ya.dbg(
 		"[tree-dbg] cd restore; tab=",
 		tab,
@@ -1888,6 +2048,13 @@ function M:setup(opts)
 		ps.sub("delete", mutation.on_remove("delete"))
 	end
 
+	-- A native Full folder reload drops the injected rows wholesale; reassert the
+	-- recorded hierarchy once such a load lands. Registered once.
+	if not load_subscribed then
+		load_subscribed = true
+		ps.sub("load", on_load)
+	end
+
 	-- Optional per-launch startup state. setup() runs during init.lua, before
 	-- Yazi's bootstrap reflow and first paint, so assigning rt.mgr.ratio here
 	-- makes the very first frame tree-shaped. app:resize/ui.render are not
@@ -1961,6 +2128,8 @@ function M:toggle()
 		M.pending_focus = nil
 		M.root_order = nil
 		M.filter_query = nil
+		M.inject_snapshot = nil
+		M.inject_has_descendants = nil
 		ya.dbg(
 			"[tree-dbg] toggle off; tab=",
 			M.active_tab,
@@ -1988,6 +2157,8 @@ function M:toggle()
 		layout.pin_sort_for(t)
 		roots.load_roots(t, t.root)
 		M.pending_focus, M.injected, M.injecting = nil, false, false
+		M.inject_snapshot = nil
+		M.inject_has_descendants = nil
 		ya.dbg("[tree-dbg] toggle on; tab=", M.active_tab, " restored=", rows.count_keys(M.expanded))
 		-- `adopt` re-applies a live native query hierarchy-aware through a
 		-- reassert queued behind the native-clear action; `suspend` and `clear`

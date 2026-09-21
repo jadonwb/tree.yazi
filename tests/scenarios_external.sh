@@ -429,3 +429,64 @@ scenario_external_preview_write_refresh() {
 	assert_log_clean
 	stop_session
 }
+
+# A native Full folder reload (interactive `refresh`, or window focus after an
+# external save marks the folder stale) replaces the cwd Folder's entries
+# wholesale. Because the tab's sort is pinned to `none` the reload is a flat
+# read_dir listing with the injected descendants gone. Subscribing to the DDS
+# `load` event must replay the previous injected rows synchronously, restore the
+# row hovered before the reload, and then rebuild once that load lands.
+scenario_load_full_reassert() {
+	new_env load_full_reassert
+	write_config true adopt
+	# Stock has no `refresh` binding on this build; add a scenario-local one so
+	# the test can emit the same Full reload a FocusIn would. `prepend_keymap`
+	# shadows the stock `<C-r>` select-all toggle for this scenario only.
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "<C-r>"
+run = "refresh"
+TOML
+	make_fixture
+	launch "$FIXTURE"
+
+	hovered_is 'alpha'
+	send_key l
+	wait_pane_has 'child.txt' 10 "alpha expands"
+	pane_matches '(├─|└─)' "the injected nested row renders a connector"
+	settle 0.5
+	pane_has 'child.txt' "the nested row stays before the refresh"
+
+	# Hover the injected nested row so the repair can restore it, then wait past
+	# one poll interval so the poll loop records it as the last hovered row.
+	send_key j
+	settle 0.4
+	hovered_is 'child.txt' "hover the injected nested row before the refresh"
+	settle 1.5
+
+	local n0
+	n0="$(rebuild_count)"
+
+	# An external root-level save changes the cwd directory's stat (and the
+	# watcher marks the folder stale), so the stock `refresh` below becomes a
+	# forced Full reload. Wait for the watcher's Upserting to land first.
+	printf 'EXTERNAL' >"$FIXTURE/root_external.txt"
+	wait_pane_has 'root_external.txt' 10 "the external root file appears"
+
+	# The Full reload drops the injected rows; the load handler must replay them
+	# synchronously and reassert, without any user action.
+	send_key C-r
+	wait_log_has 5 'full load replay' \
+		"the load handler replays the injected rows"
+	wait_rebuild_past "$n0"
+	wait_pane_has 'child.txt' 15 "the nested row is back after the native Full load"
+	settle 0.5
+	pane_matches '(├─|└─)' "connectors are restored, not a flat depth-0 listing"
+	line_before 'alpha' 'child.txt' "the nested row stays beneath its parent root"
+	hovered_is 'child.txt' "the previously hovered nested row is hovered again"
+
+	snapshot load_full_reassert
+	assert_log_clean
+	stop_session
+}

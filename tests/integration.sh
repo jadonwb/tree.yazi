@@ -92,6 +92,10 @@ SCENARIOS=(
 	tab_rapid_switch
 	tab_filter_local
 	tab_sort_local
+	sort_live_mtime
+	sort_live_natural
+	sort_live_random
+	sort_live_translit
 	cross_tab_remove_prunes_saved
 	cross_tab_rename_rekeys_saved
 	cross_tab_move_prunes_saved
@@ -121,6 +125,7 @@ SCENARIOS=(
 	external_rename_dir_preserved
 	external_recreate_prunes
 	external_preview_write_refresh
+	load_full_reassert
 	cleanup
 )
 

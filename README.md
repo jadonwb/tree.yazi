@@ -24,8 +24,8 @@ Both toggles are **tab-local**: toggling in one tab never changes another, and
 switching back to a tab restores that tab's own modes. The plugin owns `t t`
 (`plugin tree tab_create`). In a tree tab it emits the tree cwd as an explicit
 `tab_create` target, so a new tab opens at the same tree root even when a nested
-injected descendant is hovered; stock `tab_create --current` would instead reveal
-the hovered row's parent (for example `flavors` for
+injected descendant is hovered; stock `tab_create --current` would instead
+reveal the hovered row's parent (for example `flavors` for
 `flavors/arrowlake-light.yazi`) and leave the tree root. The new tree tab starts
 with an empty expansion set and, when it has no captured root order, the plugin
 seeds a directories-first alphabetical root order and rebuilds once, so the
@@ -69,10 +69,11 @@ Expansion is lazy and recursive: only directories you explicitly expand are
 read, and only directories reachable through an expanded ancestor are read, so
 an expansion buried under a collapsed parent costs no I/O. Each directory is
 read with Yazi's asynchronous `fs.read_dir` and its children are ordered
-directories-first, then alphabetically, independently at every level. `fs.read_dir`
-supports `options.limit` (unlimited by default) and `glob`, but the plugin
-deliberately reads without a limit, so a very large expanded directory reads all
-of its entries on every rebuild.
+independently at every level: directories first (unless `dir_first` is off),
+then by the tab's captured sort preference (alphabetical by default).
+`fs.read_dir` supports `options.limit` (unlimited by default) and `glob`, but
+the plugin deliberately reads without a limit, so a very large expanded
+directory reads all of its entries on every rebuild.
 
 Expansion works on the current directory's real folder entries at any depth:
 
@@ -193,22 +194,22 @@ physical tree, the plugin therefore runs one bounded poll loop: once per second
 it reads unfollowed metadata (`fs.cha`) for every currently expanded directory
 that is not inside a hidden subtree (while hidden files are off a hidden
 directory's whole subtree is skipped), and compares a compact
-`{ mtime, is_dir, dev, btime }` signature against its
-last successful snapshot. A changed mtime, a disappeared directory, a directory
-replaced by a different `(dev, btime)` identity or by a non-directory, or an
-unreadable one coalesces into a single existing generation-checked rebuild with
-the usual focus, filter, and root-order behavior, so external creates, deletes,
-and renames refresh visible descendants without touching the injected rows
-directly.
+`{ mtime, is_dir, dev, btime }` signature against its last successful snapshot.
+A changed mtime, a disappeared directory, a directory replaced by a different
+`(dev, btime)` identity or by a non-directory, or an unreadable one coalesces
+into a single existing generation-checked rebuild with the usual focus, filter,
+and root-order behavior, so external creates, deletes, and renames refresh
+visible descendants without touching the injected rows directly.
 
 Polling scope is intentionally narrow. Only the active tab's expanded
 directories are polled: collapsed subtrees are not descended, saved roots that
 belong to inactive tabs are never touched, and a native `fd://`/`rg://` provider
 View stops the loop entirely so the provider Folder is never reset. The plugin
-does not register any watch of its own and deliberately avoids Yazi's
-undocumented `watch`/`load` internals, which are unversioned and would replace
-Yazi's own watch set; if a stable upstream watcher API appears, this loop is the
-replacement point.
+does not register any watch of its own and deliberately avoids the source-only
+`watch` internal API, whose use would replace Yazi's own watch set; it does
+depend on the local `load` event, which is likewise source-only (not a
+documented DDS builtin kind), like the `fs.op`/`update_files` injection path. If
+a stable upstream watcher API appears, this loop is the replacement point.
 
 An external rename of an expanded directory is preserved on a best-effort basis.
 When an expanded path disappears or its `(dev, btime)` changes, the plugin runs
@@ -244,6 +245,23 @@ directory's mtime, so an unexpanded or unhovered file relies on the usual
 collapse (`h`) and re-expand (`l`), and filesystems with coarse or unavailable
 directory timestamps (or where `mtime` is not exposed) may not observe directory
 changes at all.
+
+A native Full folder reload is repaired rather than polled. When Yazi replaces
+the cwd Folder's entries wholesale — window focus after an external save marks
+the folder stale, an explicit `refresh`/Ctrl+R, or any other Full load — the
+injected descendants are dropped, because the folder is re-listed from disk
+while the tab's sort is pinned to `none`. The plugin subscribes to the DDS
+`load` event. Once such a load lands on the current root while tree mode still
+has expansions but the folder holds no descendants, the plugin synchronously
+re-emits the previous injected rows from the plain-table snapshot the last
+rebuild published, so the flat `sort=none` listing is never painted, then
+re-arrows to the row hovered before the reload and queues the same guarded
+reassert the hidden and sort toggles use to refresh metadata. The hierarchy
+therefore stays on screen and the cursor does not jump, without a
+poll-then-focus race (a poll-driven rebuild while the window is unfocused would
+leave the Folder stale and be wiped again on focus). This does not extend the
+poller: root-level content saves are still not polled, the root directory is not
+in scope, and the hovered nested content poll above is unchanged.
 
 ### Removal (trash and permanent delete)
 
@@ -347,20 +365,40 @@ configured sort (`sort_by`, `reverse`, `dir_first`, `sensitive`, `translit`,
 `fallback`) when tree mode is turned off. Because Yazi keeps sort preferences
 per tab, the captured handoff is stored on the tab too: a sort request in one
 tab never overwrites another tab's saved sort, and each tab restores its own
-when it leaves tree mode. The captured root order is preserved during tree mode,
-and injected children are ordered alphabetically with directories first.
+when it leaves tree mode.
 
-This is a temporary workaround: while tree mode is on, Yazi's normal root sort
-is suspended, so newly created root files may not appear in their usual sorted
-position. Sort requests are captured through the `key-sort` preflight and forced
-to `by = none` in place, rather than relying on the one-shot pin, so the
-controlled ordering survives repeated sort attempts until tree mode exits.
+While the native sorter is pinned, the plugin emulates that captured sort
+itself, per directory, so the tree still honours the user's choice: at every
+level children are grouped directories-first (unless `dir_first` is off) and
+then ordered by `by` (`alphabetical`, `natural`, `mtime`, `btime`, `extension`,
+or `size`), with `reverse` and `sensitive` applied. `natural` uses a Lua port of
+Yazi's byte-wise `strnatcmp`, so `,n`/`,N` reorder nested children and depth-0
+roots the way stock sibling order would; depth-0 roots are ordered the same way
+as children, so a newly created root file lands in its sorted position instead
+of being appended. When the primary comparison ties, the captured `fallback` is
+applied (`natural` runs the same natural comparison case-sensitively, anything
+else compares raw basename bytes), and an equal fallback falls back to the url
+so the order is deterministic. This is plugin-side emulation, not Yazi's native
+sorter: for `natural`, `translit` is applied when the captured `translit` is
+true (default off; the full 744-entry static table is ported minus its identity
+rows), and `random` is emulated with a per-tab seed that stays frozen across
+rebuilds and reshuffles only when the user requests random again (`,r`);
+`custom` still has no equivalent and falls back to alphabetical, and `size`
+compares the entry's own `cha.len`, not a recursive directory size.
 
-Custom sorting exists upstream (`SortBy::Custom`, with the `sort` action
-accepting `by = "custom"` and `fs.op("rank", { url, ranks })` plus
-`update_files` injecting `FilesOp::Rank`), but the plugin does not use it yet:
-sort-aware tree ordering is deferred, and the controlled root order described
-above is the current behavior.
+Stock sort keys (`,m`, `,s`, and so on) still work: they reach the plugin
+through the `key-sort` preflight, which records the request on the tab and
+immediately re-emulates the order (the plugin adds no keymaps of its own). The
+request is forced to `by = none` in place, so the native sorter never
+interleaves injected rows, and the controlled order survives repeated sort
+attempts until tree mode exits.
+
+This remains a workaround, because Yazi's normal sort is suspended while tree
+mode is on. The upstream `SortBy::Custom` path (the `sort` action's
+`by = "custom"` plus `fs.op("rank", { url, ranks })` and a `FilesOp::Rank`
+injection) cannot express this ordering: ranks are keyed by basename on a single
+folder, so injected descendants from different subdirectories would collide on
+the same key.
 
 ### Filtering
 
@@ -373,12 +411,12 @@ Native filtering is therefore handed off to the plugin:
 
 - `f` opens a realtime input positioned top-center, 50 cells wide, and rebuilds
   the real Entries subset as you type (debounced). The popup follows stock
-  behavior: it always opens blank, uses the
-  shared filter input name/history, keeps any active tree query applied until
-  the first realtime typed value replaces it, and applies each typed value live.
-  Yazi's own `entries.filter` is deliberately left unset, so the rendered rows,
-  `Folder` cursor, hover, selection, `Entity`/`Linemode`, and stock file
-  operations all remain aligned and native.
+  behavior: it always opens blank, uses the shared filter input name/history,
+  keeps any active tree query applied until the first realtime typed value
+  replaces it, and applies each typed value live. Yazi's own `entries.filter` is
+  deliberately left unset, so the rendered rows, `Folder` cursor, hover,
+  selection, `Entity`/`Linemode`, and stock file operations all remain aligned
+  and native.
 - Matching is a smart-case literal basename substring: a query containing an
   uppercase character is case-sensitive, otherwise it is case-folded. It is not
   Yazi's regex `Normalizer`.
@@ -513,8 +551,10 @@ normally afterwards.
 ## Limitations
 
 - **Internal API.** Expansion injects real `fs::File` entries through the
-  undocumented `fs.op("part"/"done")` plus `update_files` path. This is
-  version-sensitive and may break in a future Yazi release.
+  source-only `fs.op("part"/"done")` plus `update_files` path, and the native
+  Full-load repair depends on the source-only local `load` event. These APIs are
+  unversioned, so only compatibility with Yazi `HEAD` is promised (the plugin
+  docs label the plugin system BETA) and they may break in a future release.
 - **Symlinked directories are never expanded.** A symlink to a directory is
   shown as a directory and can be entered with `Enter`/`L`, but `l` refuses to
   descend into it (logged at debug level) so a self-referential link cannot
@@ -529,24 +569,26 @@ normally afterwards.
   plugin runs its own bounded poll (see _External changes (bounded polling)_):
   once per second it reads unfollowed metadata for the active tab's expanded
   directories outside any hidden subtree while hidden is off, and coalesces a
-  real change into one guarded rebuild. Scope is
-  strictly the active tab's expanded directories, so collapsed subtrees and
-  saved roots of inactive tabs are never observed, and detection is delayed by
-  up to roughly one interval plus a rebuild. An expanded directory renamed
-  within the reachable set is remapped by its `(dev, btime)` identity and keeps
-  its expansion; an unmatched, ambiguous, cross-filesystem, or out-of-tree move
-  is pruned so an old path cannot auto-expand again. Identity is `(dev, btime)`
-  only (Lua has no inode): filesystems with unavailable or coarse birth times
-  and case-insensitive case-only renames may fall back to a plain collapse. The
-  poll also stat-follows the one hovered injected nested file, so a content-only
-  write to _that_ file still refreshes the preview; direct child
-  create/remove/rename normally changes the directory mtime, but an unexpanded
-  or unhovered file-content write and coarse or unavailable directory timestamps
-  may not be seen, in which case collapse (`h`) and re-expand (`l`) the
-  directory. The plugin deliberately avoids Yazi's undocumented `watch`/`load`
-  internals. Create, rename, copy/move, and trash/permanent-delete completed
-  through the plugin or stock remove still rebuild explicitly, and
-  `duplicate`/`move` events refresh affected branches.
+  real change into one guarded rebuild. Scope is strictly the active tab's
+  expanded directories, so collapsed subtrees and saved roots of inactive tabs
+  are never observed, and detection is delayed by up to roughly one interval
+  plus a rebuild. An expanded directory renamed within the reachable set is
+  remapped by its `(dev, btime)` identity and keeps its expansion; an unmatched,
+  ambiguous, cross-filesystem, or out-of-tree move is pruned so an old path
+  cannot auto-expand again. Identity is `(dev, btime)` only (Lua has no inode):
+  filesystems with unavailable or coarse birth times and case-insensitive
+  case-only renames may fall back to a plain collapse. The poll also
+  stat-follows the one hovered injected nested file, so a content-only write to
+  _that_ file still refreshes the preview; direct child create/remove/rename
+  normally changes the directory mtime, but an unexpanded or unhovered
+  file-content write and coarse or unavailable directory timestamps may not be
+  seen, in which case collapse (`h`) and re-expand (`l`) the directory. The
+  plugin deliberately avoids the source-only `watch` internals; it observes
+  loads through the source-only local `load` event (its API status is noted
+  above), which reasserts the hierarchy after a native Full reload drops it.
+  Create, rename, copy/move, and
+  trash/permanent-delete completed through the plugin or stock remove still
+  rebuild explicitly, and `duplicate`/`move` events refresh affected branches.
 - **Target-aware link/hardlink is stock-only.** Yazi 26.9.1 exposes no Lua task
   kind or `fs` call for symlinks/hardlinks, so target-aware `link`/`hardlink`
   cannot be reproduced and those actions still use the current directory.
@@ -565,9 +607,16 @@ normally afterwards.
   switch. The canonical base ratio is refreshed while the active tab is idle, so
   an external ratio edit made while a non-idle tab is active is picked up on the
   next idle activation rather than immediately.
-- **Interactive refresh reloads drop injected rows;** after an explicit refresh,
-  collapse (`h`) and re-expand (`l`) the affected directory. Changing the
-  working directory restores that root's saved expansion set automatically
+- **Interactive refresh reloads keep the injected rows and restore the hovered
+  row.** A native Full reload (an explicit refresh, or window focus after an
+  external save marks the folder stale) replaces the folder's entries, but when
+  expansions are recorded and the reloaded folder has no descendants the plugin
+  synchronously re-emits the previous injected rows, re-arrows to the row
+  hovered before the reload, and rebuilds to refresh metadata, so the flat
+  depth-0 listing is not shown and the cursor stays put. If the reload lands
+  while a rebuild is already in flight the repair is skipped, so collapse (`h`)
+  and re-expand (`l`) the affected directory as a fallback. Changing the working
+  directory restores that root's saved expansion set automatically
   (asynchronously when Yazi evicted its cached Folder), and renames, bulk
   renames, removals, and hidden toggles are handled automatically. External
   mutations inside a saved root while it is not active are not observed by the
@@ -575,6 +624,13 @@ normally afterwards.
   return and collapse it; a directory later recreated at the same URL can then
   resurrect that stale expansion, matching the existing stale-key caveat for
   renames.
+- **A native Full reload can flash one frame.** A native full reload — window
+  focus after an external save within the tree root, or an explicit `refresh` —
+  may paint the flat `sort=none` cwd for one frame before the local `load` event
+  replays the recorded rows; expansions and the hovered row are preserved. The
+  frame cannot be masked: a Full load has no preflight, the Lua `FilesOp`
+  exposes no variant so Lua cannot identify or substitute one, and stock row
+  rendering cannot be replayed across frames.
 
 Compatible with Yazi 26.9.1. As with all Yazi plugins, compatibility is only
 guaranteed with the latest Yazi release.
@@ -617,9 +673,9 @@ again on a physical tree.
 Yazi has no generic action-interception bus. `Actor::hook` returns a preflight
 kind only for a fixed set of events (`key-sort`, `key-hidden`, `key-close`,
 `key-quit`, `ind-sort`, `ind-hidden`, `ind-watch`, and a few others), and
-`paste`, `create`, `rename`, `link`, and `hardlink` are not among them. No plugin
-can preflight, redirect, or cancel those actions. A keybinding or another plugin
-that emits a stock action therefore runs against the active tab's cwd and
+`paste`, `create`, `rename`, `link`, and `hardlink` are not among them. No
+plugin can preflight, redirect, or cancel those actions. A keybinding or another
+plugin that emits a stock action therefore runs against the active tab's cwd and
 bypasses tree routing entirely — `ya.emit("paste", ...)`, for example, pastes
 into the tab cwd, not into a hovered tree level.
 
@@ -627,8 +683,8 @@ Tree.yazi does not attempt such interception. It reconciles mutations started
 elsewhere only through the post-hoc `rename`, `bulk-rename`, `trash`, `delete`,
 `duplicate`, and `move` DDS events, which remap or prune the relevant saved
 expansions; actions with no corresponding event are simply not routed into the
-tree. Cross-plugin calls can still use the documented `require("tree")` module, a
-DDS custom kind, or the `plugin` action.
+tree. Cross-plugin calls can still use the documented `require("tree")` module,
+a DDS custom kind, or the `plugin` action.
 
 ## Installation
 

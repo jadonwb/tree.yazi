@@ -124,15 +124,32 @@ scenario_tab_inherit_new() {
 	add_cd_keymaps "$FIXTURE" "$DIR/away"
 	launch "$FIXTURE"
 
-	# Tab 1 (tree) expands alpha.
+	# Tab 1 (tree) expands alpha, then hovers an injected descendant so the
+	# stock `tab_create --current` reveal bug (cd to the descendant's parent)
+	# would be observable.
 	hovered_is 'alpha'
 	send_key l
 	settle 1.0
 	pane_has 'alpha1.txt'
+	send_key j
+	settle 0.4
+	hovered_is 'alpha1.txt'
 
-	# Tab 2 inherits tree mode but not tab 1's expansion.
+	# Tab 2 inherits tree mode but not tab 1's expansion. A nested hover must
+	# not reroot the new tab: it opens at the tree cwd with an empty expansion
+	# set and a directories-first root order, and the explicit-target create
+	# re-pins the live (configured) sort to none despite the inherited
+	# sort_saved.
+	local pins_before
+	pins_before="$(log_count 'pinning sort_by=none')"
 	send_key t
 	settle 1.2
+	header_has "$FIXTURE" "nested-hover tab create stays at the tree cwd"
+	header_lacks "$FIXTURE/alpha" "tab create must not reveal the hovered parent"
+	pane_lacks 'alpha1.txt' "new tab has an empty expansion set"
+	line_before 'alpha' 'zz.txt'
+	[ "$(log_count 'pinning sort_by=none')" = "$((pins_before + 1))" ] ||
+		fail "explicit-target tab should re-pin sort_by=none"
 	local i=0
 	while [ "$i" -lt 4 ]; do
 		if [ "$(hovered_name)" = "gamma" ]; then

@@ -72,6 +72,9 @@ SCENARIOS=(
 	remove_hovered_root_fallback
 	remove_subtree_inside_fallback
 	remove_filtered_unrelated
+	remove_last_child_keeps_expanded
+	remove_root_middle_next
+	remove_filtered_middle_next
 	cd_return_restores
 	cd_return_new_root
 	home_roundtrip
@@ -105,6 +108,8 @@ SCENARIOS=(
 	search_toggle_defer
 	external_create_deep
 	external_delete_deep
+	external_delete_hovered_nested
+	external_delete_last_nested_clamp
 	external_rename_file_deep
 	external_filter_preserved
 	external_no_churn

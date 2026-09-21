@@ -32,26 +32,6 @@ local function same_tab(tab)
 	return tonumber(tab) == id
 end
 
--- Nearest surviving ancestor directory of `url_str` inside the tree root. Walks
--- the cwd-relative path upward, skipping any ancestor removed by the same batch,
--- and returns nil for a root row (whose parent is the tree root, not a row). No
--- filesystem access: the event fires after the removal and every ancestor of a
--- removed path is itself a directory unless the same batch removed it.
-local function nearest_surviving_parent(ctl, url_str, removed)
-	local cwd = ctl.cwd()
-	local cwd_str = tostring(cwd)
-	local rel = ctl.rel_of(url_str)
-	local parent_rel = rel and rel:match("^(.*)/[^/]*$") or nil
-	while parent_rel and parent_rel ~= "" do
-		local candidate = tostring(cwd:join(parent_rel))
-		if candidate ~= cwd_str and not removed[candidate] then
-			return candidate
-		end
-		parent_rel = parent_rel:match("^(.*)/[^/]*$")
-	end
-	return nil
-end
-
 -- Apply one (from, to) pair. Returns whether the injected hierarchy changes and
 -- the remapped depth-0 order (nil when the plugin has no controlled order yet).
 local function rename_one(ctl, from_str, to_str)
@@ -294,7 +274,6 @@ local function on_remove(ctl, kind)
 			return
 		end
 
-		local removed = {}
 		local roots = {}
 		local all_removed = {}
 		local affected = false
@@ -303,7 +282,6 @@ local function on_remove(ctl, kind)
 			all_removed[#all_removed + 1] = u_str
 			local rel = ctl.rel_of(u_str)
 			if rel and rel ~= "" then
-				removed[u_str] = true
 				roots[#roots + 1] = u_str
 				local parent = Url(u_str).parent
 				local parent_str = parent and tostring(parent) or ""
@@ -328,12 +306,15 @@ local function on_remove(ctl, kind)
 
 		local pruned_expanded, pruned_rows = ctl.prune_for_removal(roots)
 
-		-- Focus anchor. Capture the pre-event hovered URL and the visible row
-		-- order, then anchor: (1) the hovered row when it survives outside every
-		-- removed subtree, (2) its nearest surviving parent row when the hovered
-		-- row was removed, (3) the nearest prior then nearest next surviving
-		-- visible row. Candidates are resolved in order by M:focus, so a
-		-- candidate later hidden by the active tree filter is skipped.
+		-- Focus anchor. Stock Yazi's removal keeps the cursor's slot index: a
+		-- surviving hovered row stays put, otherwise the next surviving row
+		-- shifts up into the deleted slot, and only an end-of-list delete clamps
+		-- back to the previous row. Recreate that over the pre-change visible
+		-- sequence by scanning forward from the hovered slot, then backward,
+		-- skipping every removed subtree. There is deliberately no ancestor
+		-- tier: a surviving parent is not stock's replacement for a deleted
+		-- descendant. Candidates are resolved in order by M:focus, so one later
+		-- hidden by the active tree filter is skipped.
 		local h = ctl.hovered()
 		local hovered_str = h and tostring(h.url) or nil
 		local candidates, seen = {}, {}
@@ -342,13 +323,6 @@ local function on_remove(ctl, kind)
 				seen[u] = true
 				candidates[#candidates + 1] = u
 			end
-		end
-
-		if hovered_str and ctl.rel_of(hovered_str) and not in_any_subtree(hovered_str, all_removed) then
-			add_candidate(hovered_str)
-		end
-		if hovered_str then
-			add_candidate(nearest_surviving_parent(ctl, hovered_str, removed))
 		end
 
 		local files = cx.active.current.files
@@ -365,13 +339,13 @@ local function on_remove(ctl, kind)
 		local function survivor(u)
 			return ctl.rel_of(u) ~= nil and not in_any_subtree(u, all_removed)
 		end
-		for i = idx - 1, 1, -1 do
+		for i = idx, #files do
 			local u = tostring(files[i].url)
 			if survivor(u) then
 				add_candidate(u)
 			end
 		end
-		for i = idx + 1, #files do
+		for i = idx - 1, 1, -1 do
 			local u = tostring(files[i].url)
 			if survivor(u) then
 				add_candidate(u)

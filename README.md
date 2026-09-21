@@ -17,27 +17,33 @@ What the plugin does today:
 
 - **Tree mode** (`toggle`) collapses the parent column into the current pane and
   enables expand/collapse navigation.
-- **Preview mode** (`preview`) toggles the preview pane; turning it off gives the
-  preview space to the current pane.
+- **Preview mode** (`preview`) toggles the preview pane; turning it off gives
+  the preview space to the current pane.
 
 Both toggles are **tab-local**: toggling in one tab never changes another, and
-switching back to a tab restores that tab's own modes. A new tab inherits the
-creating tab's tree and preview modes (so `tab_create` from a tree tab opens a
-tree tab), while its expansion set, root order, and filter start empty. When the
-creating tab is a tree tab, its configured (pre-pin) sort is carried over to the
-new tab too, because Yazi clones the creator's sort preference (already pinned to
-`none` while the tree is expanded); leaving tree mode in the new tab therefore
-restores that configured sort rather than the pinned `none`.
+switching back to a tab restores that tab's own modes. The plugin owns `t t`
+(`plugin tree tab_create`). In a tree tab it emits the tree cwd as an explicit
+`tab_create` target, so a new tab opens at the same tree root even when a nested
+injected descendant is hovered; stock `tab_create --current` would instead reveal
+the hovered row's parent (for example `flavors` for
+`flavors/arrowlake-light.yazi`) and leave the tree root. The new tree tab starts
+with an empty expansion set and, when it has no captured root order, the plugin
+seeds a directories-first alphabetical root order and rebuilds once, so the
+fresh listing is deterministic rather than raw `read_dir` order. Because an
+explicit-target create does not clone the creator's pinned `none` preference,
+the plugin re-pins the new tab's live configured sort to `none`; leaving tree
+mode in the new tab therefore restores that configured sort. Outside tree mode
+`t t` re-emits stock `tab_create --current` unchanged.
 
 The two toggles are independent and compose, so all four combinations restore
 predictably:
 
-| tree | preview | effective ratio |
-| ---- | ------- | --------------- |
-| off  | on      | the configured ratio, unmodified |
+| tree | preview | effective ratio                           |
+| ---- | ------- | ----------------------------------------- |
+| off  | on      | the configured ratio, unmodified          |
 | on   | on      | parent collapsed, preview keeps its share |
-| off  | off     | preview space in current |
-| on   | off     | parent and preview space in current |
+| off  | off     | preview space in current                  |
+| on   | off     | parent and preview space in current       |
 
 The plugin captures one canonical base ratio from `rt.mgr.ratio` while the
 active tab is idle (tree off, preview on), recomposes the effective ratio from
@@ -50,14 +56,14 @@ plugin does not patch `Tab.layout` or `Tab._chunks`.
 ## Tree expansion
 
 While tree mode is enabled, the plugin overrides only `Current.redraw` and
-reproduces the stock renderer over the pane's already-loaded folder window.
-Each existing item produces exactly one row through `Entity:new(file):redraw()`,
-so hover, selection markers, linemode text, and drag/drop rendering are
-preserved. Root entries (direct children of the current directory) render
-flush-left with no prefix; only injected descendants are prefixed with branch
-connectors, so the listing reads as a tree without a synthetic root row. When
-tree mode is disabled or the directory is empty, rendering falls back to the
-unmodified stock renderer.
+reproduces the stock renderer over the pane's already-loaded folder window. Each
+existing item produces exactly one row through `Entity:new(file):redraw()`, so
+hover, selection markers, linemode text, and drag/drop rendering are preserved.
+Root entries (direct children of the current directory) render flush-left with
+no prefix; only injected descendants are prefixed with branch connectors, so the
+listing reads as a tree without a synthetic root row. When tree mode is disabled
+or the directory is empty, rendering falls back to the unmodified stock
+renderer.
 
 Expansion is lazy and recursive: only directories you explicitly expand are
 read, and only directories reachable through an expanded ancestor are read, so
@@ -87,23 +93,22 @@ Expansion works on the current directory's real folder entries at any depth:
   hovered files normally.
 
 Multiple directories can be expanded at once at any depth, and collapsing one
-leaves unrelated expansions intact. Expansion state is kept per tab and per
-tree root: leaving a directory saves its expanded set, root order, and
-tree-filter query, and returning to it (through `H`, `L`, `Enter`, a mouse
-click that reveals a nested row, a `cd` keymap, or history back/forward)
-restores that same hierarchy instead of showing Yazi's cached rows against an
-empty expansion set. Each tab keeps its own saved roots and its own tree/preview
-modes, so switching or creating tabs never leaks one tab's expansions, filters,
-or layout into another, and toggling tree in one tab leaves every other tab
-untouched. A root whose Yazi folder-cache entry was evicted is re-injected
-asynchronously, so its expanded children can be briefly missing right after the
-return until the read completes. Renames and removals re-key or prune the saved
-roots for every tab, so a renamed or deleted path can never resurrect its old
-expansion later. Toggling tree view off and back on preserves that tab's state:
-disabling removes the injected rows and leaves normal mode with only the
-folder's real entries, while re-enabling restores the tab/root's saved
-expansions and root order (with any native filter transferred according to
-`filter_mode`).
+leaves unrelated expansions intact. Expansion state is kept per tab and per tree
+root: leaving a directory saves its expanded set, root order, and tree-filter
+query, and returning to it (through `H`, `L`, `Enter`, a mouse click that
+reveals a nested row, a `cd` keymap, or history back/forward) restores that same
+hierarchy instead of showing Yazi's cached rows against an empty expansion set.
+Each tab keeps its own saved roots and its own tree/preview modes, so switching
+or creating tabs never leaks one tab's expansions, filters, or layout into
+another, and toggling tree in one tab leaves every other tab untouched. A root
+whose Yazi folder-cache entry was evicted is re-injected asynchronously, so its
+expanded children can be briefly missing right after the return until the read
+completes. Renames and removals re-key or prune the saved roots for every tab,
+so a renamed or deleted path can never resurrect its old expansion later.
+Toggling tree view off and back on preserves that tab's state: disabling removes
+the injected rows and leaves normal mode with only the folder's real entries,
+while re-enabling restores the tab/root's saved expansions and root order (with
+any native filter transferred according to `filter_mode`).
 
 Because Yazi caches a whole Folder (including the plugin's injected rows) per
 tab, a tree tab's injected Folder stays valid while the tab is inactive, but can
@@ -117,47 +122,46 @@ into a tab that has since become active or into a tab that has become classic.
 
 The injected rows and the expansion state are keyed by URL, so a rename would
 otherwise strand descendants under an old path. The plugin subscribes to the
-`rename` and `bulk-rename` DDS events, remaps the expanded directory URLs and the
-captured root order, and coalesces the result through the same
-generation-checked async rebuild pipeline. Renaming a root keeps that
-root's slot instead of letting Yazi's incremental upsert append it to the end,
-and renaming a child under an expanded directory refreshes the child rows.
-Renaming a directory rewrites every expansion key beneath it from the old
-cwd-relative prefix to the new one (with path-boundary comparison, so renaming
-`alpha/b` never touches `alpha/bc`), so an expanded descendant stays expanded
-under the new name instead of silently collapsing and leaving a stale key that
-could later resurrect expansion at the old URL. A directory moved outside the
-tree root has its subtree keys pruned instead. The same re-keying is applied to
-the saved per-root state of every tab regardless of which tab the rename came
-from, so a rename performed in a classic tab cannot leave a tree tab's stale
-expansion keys behind, and a root that was expanded, left, and then renamed
-underneath can still not resurrect its old path when revisited. Live-state
-remap and the follow-up rebuild apply only to the active tree tab.
-Bulk rename resolves each key
-against the untouched old-to-new map, so swaps and chains stay
+`rename` and `bulk-rename` DDS events, remaps the expanded directory URLs and
+the captured root order, and coalesces the result through the same
+generation-checked async rebuild pipeline. Renaming a root keeps that root's
+slot instead of letting Yazi's incremental upsert append it to the end, and
+renaming a child under an expanded directory refreshes the child rows. Renaming
+a directory rewrites every expansion key beneath it from the old cwd-relative
+prefix to the new one (with path-boundary comparison, so renaming `alpha/b`
+never touches `alpha/bc`), so an expanded descendant stays expanded under the
+new name instead of silently collapsing and leaving a stale key that could later
+resurrect expansion at the old URL. A directory moved outside the tree root has
+its subtree keys pruned instead. The same re-keying is applied to the saved
+per-root state of every tab regardless of which tab the rename came from, so a
+rename performed in a classic tab cannot leave a tree tab's stale expansion keys
+behind, and a root that was expanded, left, and then renamed underneath can
+still not resurrect its old path when revisited. Live-state remap and the
+follow-up rebuild apply only to the active tree tab. Bulk rename resolves each
+key against the untouched old-to-new map, so swaps and chains stay
 order-independent. Toggling hidden files schedules a rebuild after the actor, so
 hidden entries are re-split without flattening the injected hierarchy.
 
 `r` is routed through the plugin. Outside tree mode, when the hovered row is a
 depth-0 entry, or when there is an active native multi-selection, it re-emits
 stock rename with the preset binding's `cursor = "before_ext"`, so root renames
-and stock bulk rename (which the plugin already remaps through the
-`bulk-rename` subscription) keep stock caret placement and behave as before.
-Because the prepended `r` binding replaces the user's original action args, any
-customized `r` arguments (for example `--empty`) are not forwarded. For a single
-injected descendant at any depth it opens a positioned input prefilled with the
-complete current name, resolves the new path beside that descendant's parent,
-asks for confirmation before overwriting an existing sibling, and performs the
-rename with `fs.rename` followed by a prefix re-key of the expansion set and a
+and stock bulk rename (which the plugin already remaps through the `bulk-rename`
+subscription) keep stock caret placement and behave as before. Because the
+prepended `r` binding replaces the user's original action args, any customized
+`r` arguments (for example `--empty`) are not forwarded. For a single injected
+descendant at any depth it opens a positioned input prefilled with the complete
+current name, resolves the new path beside that descendant's parent, asks for
+confirmation before overwriting an existing sibling, and performs the rename
+with `fs.rename` followed by a prefix re-key of the expansion set and a
 generation-checked rebuild of the controlled hierarchy (so renaming an expanded
 nested directory keeps its expanded descendants). The current root and working
 directory are never changed, and cancelling the input is a no-op.
 
-The plugin-owned input reproduces stock `rename --cursor=before_ext`
-placement: for a regular file it opens a realtime input and then emits the
-input layer's own `move` offset, so the caret starts at the last `.` in the name.
-Directories, symlinks, special files, dotfiles, and extensionless names keep the
-default end-of-value caret, matching stock. Because the caret starts before the
+The plugin-owned input reproduces stock `rename --cursor=before_ext` placement:
+for a regular file it opens a realtime input and then emits the input layer's
+own `move` offset, so the caret starts at the last `.` in the name. Directories,
+symlinks, special files, dotfiles, and extensionless names keep the default
+end-of-value caret, matching stock. Because the caret starts before the
 extension, clearing a prefilled name with a plain backspace run would leave the
 suffix behind; use kill-to-BOL plus kill-to-EOL (or select all) when scripting
 renames.
@@ -184,8 +188,8 @@ current, parent, and hovered folders, so a mutation inside an expanded directory
 at depth 1 or deeper never reaches the injected rows. While the active tab is a
 physical tree, the plugin therefore runs one bounded poll loop: once per second
 it reads unfollowed metadata (`fs.cha`) for every currently expanded directory
-and compares a compact `{ mtime, is_dir, dev, btime }` signature against its last
-successful snapshot. A changed mtime, a disappeared directory, a directory
+and compares a compact `{ mtime, is_dir, dev, btime }` signature against its
+last successful snapshot. A changed mtime, a disappeared directory, a directory
 replaced by a different `(dev, btime)` identity or by a non-directory, or an
 unreadable one coalesces into a single existing generation-checked rebuild with
 the usual focus, filter, and root-order behavior, so external creates, deletes,
@@ -210,18 +214,19 @@ expansion prefix to the new URL — descendants, each tab's saved roots, and the
 depth-0 root order included — so the subtree stays expanded where it moved. With
 no match, more than one match, an unavailable identity, a cross-filesystem
 copy/delete, or a destination outside the reachable set, the obsolete prefix is
-pruned instead, becoming a tombstone: a directory later recreated at the old path
-cannot silently re-expand. Because only `dev` and `btime` are exposed to Lua (no
-inode), identity is not a universal guarantee — filesystems with unavailable or
-coarse birth times, ambiguous duplicate identities, and case-only renames on
-case-insensitive filesystems may collapse to the prune path, and a rename is
-detected within roughly one polling interval plus a rebuild.
+pruned instead, becoming a tombstone: a directory later recreated at the old
+path cannot silently re-expand. Because only `dev` and `btime` are exposed to
+Lua (no inode), identity is not a universal guarantee — filesystems with
+unavailable or coarse birth times, ambiguous duplicate identities, and case-only
+renames on case-insensitive filesystems may collapse to the prune path, and a
+rename is detected within roughly one polling interval plus a rebuild.
 
-The rebuild also reconciles reachability: after re-reading the tree it keeps only
-the expansion keys it actually reached, plus keys under a directory whose listing
-failed (that subtree is unverifiable, not proven gone). A key whose expanded
-ancestor chain no longer leads to it is dropped, so a stale key removed from the
-live set cannot be resurrected by a later unrelated recreation of its path.
+The rebuild also reconciles reachability: after re-reading the tree it keeps
+only the expansion keys it actually reached, plus keys under a directory whose
+listing failed (that subtree is unverifiable, not proven gone). A key whose
+expanded ancestor chain no longer leads to it is dropped, so a stale key removed
+from the live set cannot be resurrected by a later unrelated recreation of its
+path.
 
 Content-only writes are also covered for one file: the poll additionally
 stat-follows the currently hovered visible injected regular file (depth > 0) and
@@ -229,7 +234,7 @@ compares its displayed `mtime`/`len`. On a difference, disappearance, or type
 change it schedules the same guarded rebuild, whose fresh `File` metadata makes
 Yazi's own preview logic rerun the previewer — no forced peek and no cwd change.
 This costs at most one extra stat per interval, and only while such a file is
-hovered. Writing the file's *contents* still does not change the parent
+hovered. Writing the file's _contents_ still does not change the parent
 directory's mtime, so an unexpanded or unhovered file relies on the usual
 collapse (`h`) and re-expand (`l`), and filesystems with coarse or unavailable
 directory timestamps (or where `mtime` is not exposed) may not observe directory
@@ -239,10 +244,10 @@ changes at all.
 
 Stock remove works on injected rows at every depth without plugin routing: `d`
 trashes and `D` permanently deletes the selected-or-hovered entries, whether
-they are root rows or injected descendants. Yazi's own trash/delete
-confirmation popup, task list, progress and error reporting, and
-ancestor/descendant selection safety are unchanged and remain authoritative;
-the plugin does not intercept the keys or redirect the targets.
+they are root rows or injected descendants. Yazi's own trash/delete confirmation
+popup, task list, progress and error reporting, and ancestor/descendant
+selection safety are unchanged and remain authoritative; the plugin does not
+intercept the keys or redirect the targets.
 
 On successful completion Yazi emits a batched local `trash`/`delete` DDS event.
 The plugin subscribes once and prunes every removed URL and subtree from the
@@ -250,19 +255,20 @@ saved per-root state of every tab regardless of which tab is active or in tree
 mode, so a removal performed from a classic tab cannot leave a tree tab's stale
 expansion keys behind. While the active tab is in tree mode it additionally
 prunes those URLs from the live expansion state and row metadata, then runs one
-generation-checked rebuild. The cursor anchor follows the pre-removal view:
-if the hovered row survives outside every removed subtree it keeps the cursor;
-if it was removed, the nearest surviving parent row is focused; if that parent
-is not a row (a root-level entry, or a parent removed in the same batch), the
-nearest prior surviving visible row is focused, else the nearest next one. The
-candidate rows come from the visible set at event time, so an active tree filter
-is respected and a fallback that the filter still hides is skipped. Removed rows
+generation-checked rebuild. The cursor anchor keeps its visible slot like stock
+Yazi: if the hovered row survives outside every removed subtree it keeps the
+cursor; otherwise the next surviving visible row at the deleted slot is focused,
+and only at the end of the list does the focus fall back to the previous visible
+row. An ancestor/parent row is never focused in place of the next row, and an
+expanded directory whose children were all removed stays expanded. The candidate
+rows come from the visible set at event time, so an active tree filter is
+respected and a candidate that the filter still hides is skipped. Removed rows
 therefore disappear immediately, trashing or deleting an expanded directory
-takes its injected descendants with it, unrelated expanded branches and an
-unrelated hover survive untouched, and the working directory never changes.
-Because the saved-state pruning covers every tab, a removed directory cannot
-resurrect its old expansion if a new directory is later created at the same
-path.
+takes its injected descendants with it and prunes only the removed subtree,
+unrelated expanded branches and an unrelated hover survive untouched, and the
+working directory never changes. Because the saved-state pruning covers every
+tab, a removed directory cannot resurrect its old expansion if a new directory
+is later created at the same path.
 
 ### Target-aware create
 
@@ -287,9 +293,9 @@ Collision handling differs by type, and create never uses the trash:
   place: no unlink, no missing-path window, and the inode is preserved.
   Declining the confirm leaves the file untouched; `--force` skips the confirm.
 - An existing **directory** can never be replaced by an empty file, so it is a
-  clean failure with an error notification (`... already exists as a
-  directory`) instead of a confirm followed by an `EISDIR` error. The directory
-  and its contents are untouched.
+  clean failure with an error notification (`... already exists as a directory`)
+  instead of a confirm followed by an `EISDIR` error. The directory and its
+  contents are untouched.
 - An existing **symlink** is unlinked at the link path only (a hard unlink,
   never the trash) and then replaced by the new empty file, so the link target's
   bytes are never truncated. This also requires the overwrite confirm unless
@@ -314,8 +320,8 @@ plugin does not override them. `p` and `P` are routed through the plugin:
   instead. Note that forcing a directory copy onto an existing directory merges
   the trees rather than deleting entries that are absent from the source.
 - A cut paste clears the yank set with `unyank` after the moves are scheduled
-  and clears the active selection (`escape --select`) when one exists, since
-  Lua has no API to drop only the moved URLs from the selection. A copy paste
+  and clears the active selection (`escape --select`) when one exists, since Lua
+  has no API to drop only the moved URLs from the selection. A copy paste
   preserves the yank set, like stock.
 - Successful `duplicate` and `move` events trigger one generation-checked
   rebuild when either endpoint is the tree root or an expanded directory, so
@@ -354,8 +360,8 @@ ancestor. Yazi also re-applies the native Entries filter to every injected row,
 so leaving it live while descendants are injected double-filters the view.
 Native filtering is therefore handed off to the plugin:
 
-- `f` opens a realtime input positioned top-center with the same width as
-  Yazi's stock filter popup, and rebuilds the real Entries subset as you type
+- `f` opens a realtime input positioned top-center with the same width as Yazi's
+  stock filter popup, and rebuilds the real Entries subset as you type
   (debounced). The popup follows stock behavior: it always opens blank, uses the
   shared filter input name/history, keeps any active tree query applied until
   the first realtime typed value replaces it, and applies each typed value live.
@@ -369,11 +375,11 @@ Native filtering is therefore handed off to the plugin:
   when at least one of its children matches, so every matching child keeps its
   ancestor directly above it. Visible rows stay in stable depth-first order
   (each root followed by its visible children).
-- Submitting (`<Enter>`) applies the typed query and closes the popup; submitting
-  a blank value clears it, matching stock. Cancelling (`<Esc>`) also just closes
-  the popup and keeps the latest live-applied query — like stock's Filter actor,
-  which ignores Cancel and never reverts or clears. Press `<Esc>` again with the
-  popup closed to clear the tree query.
+- Submitting (`<Enter>`) applies the typed query and closes the popup;
+  submitting a blank value clears it, matching stock. Cancelling (`<Esc>`) also
+  just closes the popup and keeps the latest live-applied query — like stock's
+  Filter actor, which ignores Cancel and never reverts or clears. Press `<Esc>`
+  again with the popup closed to clear the tree query.
 - `<Esc>` after the popup has closed clears an active tree filter and restores
   the full injected hierarchy. When no tree filter is active (and outside tree
   mode) it falls through to Yazi's stock `escape` cascade, and `f` falls through
@@ -387,11 +393,11 @@ changes which rows are visible but does not add plugin-owned selection.
 A native filter that is active when tree mode starts is read before the first
 injection, cleared from Yazi's Entries, and handled according to `filter_mode`:
 
-| `filter_mode` | on entering tree mode | on leaving tree mode |
-| ------------- | --------------------- | -------------------- |
-| `adopt` (default) | re-applied as the hierarchy-aware tree query | the current tree query is handed back to native filtering |
-| `suspend` | saved and not applied, so the full tree shows | the saved pre-tree query is restored |
-| `clear` | discarded permanently | nothing is restored |
+| `filter_mode`     | on entering tree mode                         | on leaving tree mode                                      |
+| ----------------- | --------------------------------------------- | --------------------------------------------------------- |
+| `adopt` (default) | re-applied as the hierarchy-aware tree query  | the current tree query is handed back to native filtering |
+| `suspend`         | saved and not applied, so the full tree shows | the saved pre-tree query is restored                      |
+| `clear`           | discarded permanently                         | nothing is restored                                       |
 
 Set it in `~/.config/yazi/init.lua`:
 
@@ -399,9 +405,9 @@ Set it in `~/.config/yazi/init.lua`:
 require("tree"):setup({ filter_mode = "suspend" }) -- "adopt" (default) | "suspend" | "clear"
 ```
 
-`adopt` keeps a single hierarchy-aware filtering pass and is the default.
-Yazi exposes only a filter's raw query string to plugins, not its case mode or
-regex, so a restored query always uses smart case (matching the stock `f` /
+`adopt` keeps a single hierarchy-aware filtering pass and is the default. Yazi
+exposes only a filter's raw query string to plugins, not its case mode or regex,
+so a restored query always uses smart case (matching the stock `f` /
 `filter --smart` binding), and `adopt` interprets the query with the plugin's
 literal basename matcher rather than Yazi's regex `Normalizer`. `suspend` and
 `clear` never re-interpret the query, so the original native semantics survive
@@ -433,18 +439,18 @@ Choose the prefix style in `~/.config/yazi/init.lua`:
 require("tree"):setup({ style = "lines" })
 ```
 
-| `style` | rendering |
-| ------- | --------- |
-| `lines` (default) | compact ancestor/branch connectors (` ├─`, ` └─`, ` │ `) |
-| `indent` | equal-width spaces with no visible lines |
+| `style`           | rendering                                              |
+| ----------------- | ------------------------------------------------------ |
+| `lines` (default) | compact ancestor/branch connectors (` ├─`, ` └─`, `│`) |
+| `indent`          | equal-width spaces with no visible lines               |
 
 Root rows stay flush-left in both styles; each injected depth adds one
 three-cell indent step, so a depth-1 icon sits in the same column whether the
 prefix is a connector or a plain indent. `indent` keeps that depth spacing but
 draws no lines.
 
-Optional `glyphs` overrides replace individual connectors. Each glyph may be
-any width, but all four must share one width or the columns drift apart; an
+Optional `glyphs` overrides replace individual connectors. Each glyph may be any
+width, but all four must share one width or the columns drift apart; an
 inconsistent or non-string set is ignored and the defaults are used. Missing
 keys fall back to the defaults, and the old wider forms still work as overrides:
 
@@ -477,9 +483,9 @@ require("tree"):setup({
 
 `startup.tree` defaults to `false` and `startup.preview` defaults to `true`, so
 omitting the `startup` table leaves Yazi's ordinary initial layout untouched.
-The startup values also seed every tab the plugin first observes (for example the
-boot tab and any tab created before the plugin has seen a `tab` event), while
-tabs created afterwards inherit the creating tab's modes.
+The startup values also seed every tab the plugin first observes (for example
+the boot tab and any tab created before the plugin has seen a `tab` event),
+while tabs created afterwards inherit the creating tab's modes.
 
 To launch the embedded tree mode only for specific invocations, gate it on an
 environment variable (for example, an embedded Neovim terminal) so ordinary
@@ -520,14 +526,14 @@ normally afterwards.
   shown as a directory and can be entered with `Enter`/`L`, but `l` refuses to
   descend into it (logged at debug level) so a self-referential link cannot
   recurse forever. There is no follow mode and no inode-based cycle detection.
-- **Uncapped, uncached reads.** Each rebuild asynchronously re-reads the root and
-  every reachable expanded directory with no per-directory entry limit and no
-  children cache, so a rebuild's I/O is proportional to the total entries of the
-  expanded directories, not just the visible window.
+- **Uncapped, uncached reads.** Each rebuild asynchronously re-reads the root
+  and every reachable expanded directory with no per-directory entry limit and
+  no children cache, so a rebuild's I/O is proportional to the total entries of
+  the expanded directories, not just the visible window.
 - **External changes below the root are polled, not watched.** Yazi's watcher
   only covers the current, parent, and hovered folders, non-recursively, and
   watcher ops for a nested trail never touch the injected rows. Instead the
-  plugin runs its own bounded poll (see *External changes (bounded polling)*):
+  plugin runs its own bounded poll (see _External changes (bounded polling)_):
   once per second it reads unfollowed metadata for the active tab's expanded
   directories and coalesces a real change into one guarded rebuild. Scope is
   strictly the active tab's expanded directories, so collapsed subtrees and
@@ -536,10 +542,10 @@ normally afterwards.
   within the reachable set is remapped by its `(dev, btime)` identity and keeps
   its expansion; an unmatched, ambiguous, cross-filesystem, or out-of-tree move
   is pruned so an old path cannot auto-expand again. Identity is `(dev, btime)`
-  only (Lua has no inode): filesystems with unavailable or coarse birth times and
-  case-insensitive case-only renames may fall back to a plain collapse. The poll
-  also stat-follows the one hovered injected nested file, so a content-only write
-  to *that* file still refreshes the preview; direct child
+  only (Lua has no inode): filesystems with unavailable or coarse birth times
+  and case-insensitive case-only renames may fall back to a plain collapse. The
+  poll also stat-follows the one hovered injected nested file, so a content-only
+  write to _that_ file still refreshes the preview; direct child
   create/remove/rename normally changes the directory mtime, but an unexpanded
   or unhovered file-content write and coarse or unavailable directory timestamps
   may not be seen, in which case collapse (`h`) and re-expand (`l`) the
@@ -553,15 +559,15 @@ normally afterwards.
 - **Cut-paste selection clearing is coarser than stock.** Lua can only clear the
   whole active selection (`escape --select`), not just the moved URLs, so a cut
   paste that had an active selection clears all of it.
-- **Filter matching is literal, not regex.** The query is matched as a smart-case
-  basename substring, so Yazi's regex `Normalizer` syntax and match highlighting
-  do not apply.
+- **Filter matching is literal, not regex.** The query is matched as a
+  smart-case basename substring, so Yazi's regex `Normalizer` syntax and match
+  highlighting do not apply.
 - **Filter case mode is not recoverable.** Yazi exposes only the raw query
-  string to Lua, so a restored `adopt` or `suspend` query always uses smart case;
-  a native sensitive/insensitive choice is not preserved.
+  string to Lua, so a restored `adopt` or `suspend` query always uses smart
+  case; a native sensitive/insensitive choice is not preserved.
 - **The header indicator patches an internal method.** `(filter: query)` is
-  added by wrapping the preset `Header:flags`, which is version-sensitive and may
-  need updating on a future Yazi release.
+  added by wrapping the preset `Header:flags`, which is version-sensitive and
+  may need updating on a future Yazi release.
 - **Inactive-tab layout is applied on activation.** Yazi exposes a single global
   `rt.mgr.ratio`, so a tab's tree/preview layout is only observable once it is
   activated; the plugin re-applies the incoming tab's effective ratio on every
@@ -668,6 +674,11 @@ desc = "Toggle tree view"
 on = ["t", "p"]
 run = "plugin tree preview"
 desc = "Toggle preview pane"
+
+[[mgr.prepend_keymap]]
+on = ["t", "t"]
+run = "plugin tree tab_create"
+desc = "Tree: new tab in tree cwd or stock smart tab"
 ```
 
 Outside a tree-mode tab the `h`, `l`, `H`, `L`, `<Enter>`, `a`, `p`, and `P`
@@ -678,14 +689,16 @@ filtering are unchanged. The `r` binding re-emits stock rename with
 `cursor = "before_ext"` outside tree mode, on root-level rows, and with an
 active multi-selection, so ordinary renames and bulk renames keep stock caret
 placement and behavior. When tree mode is on but no tree filter is active,
-`<Esc>` also falls through to the stock escape cascade. Mode routing is
-per-tab, so these fallbacks apply based on the active tab's own tree flag.
+`<Esc>` also falls through to the stock escape cascade. The `t t` binding opens
+a new tab at the tree cwd in tree mode (ignoring the hover) and otherwise
+re-emits stock `tab_create --current`, so ordinary smart-tab behavior is
+unchanged. Mode routing is per-tab, so these fallbacks apply based on the active
+tab's own tree flag.
 
 The force-paste binding uses the `plugin <name> -- <args>` form because Yazi's
-`--` separator is what keeps `--force` inside the plugin's own argument list
-(the same form the preset `plugin sudo -- paste --force` bindings use). A plain
-`plugin tree paste --force` would parse `--force` as an argument of the outer
-`plugin` action and drop it before the plugin sees it.
+`--` separator is what keeps `--force` inside the plugin's own argument list . A
+plain `plugin tree paste --force` would parse `--force` as an argument of the
+outer `plugin` action and drop it before the plugin sees it.
 
 Note that the keybindings above are just examples, please tune them up as needed
 to ensure they don't conflict with your other actions/plugins.
@@ -698,12 +711,12 @@ To see the plugin's debug output, start Yazi with `YAZI_LOG` set to `debug`:
 YAZI_LOG=debug ya
 ```
 
-Rebuilds log a bounded pair of lines: `rebuild gen=... expanded=... filter=...
-focus=...` when a rebuild starts, and `rebuild done gen=... dirs=... rows=...
-expanded=... ms=...` when it finishes, where `dirs` is the number of directories
-actually read and `rows` is the number of injected rows. A rebuild that is
-discarded as stale returns before emitting and does not log the completion
-line.
+Rebuilds log a bounded pair of lines:
+`rebuild gen=... expanded=... filter=... focus=...` when a rebuild starts, and
+`rebuild done gen=... dirs=... rows=... expanded=... ms=...` when it finishes,
+where `dirs` is the number of directories actually read and `rows` is the number
+of injected rows. A rebuild that is discarded as stale returns before emitting
+and does not log the completion line.
 
 ## Testing
 

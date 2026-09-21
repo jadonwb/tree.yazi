@@ -88,6 +88,68 @@ scenario_external_delete_deep() {
 	stop_session
 }
 
+# External deletion of the hovered injected nested row must keep the cursor's
+# slot: the next visible survivor takes the deleted row instead of the poll
+# rebuild resetting the cursor to the first root row.
+scenario_external_delete_hovered_nested() {
+	new_env external_delete_hovered_nested
+	write_config true adopt
+	make_fixture
+	launch "$FIXTURE"
+
+	hovered_is 'alpha'
+	send_key l
+	wait_pane_has 'child.txt' 10 "alpha expands"
+	send_key j
+	settle 0.4
+	hovered_is 'child.txt'
+	settle 2.0
+
+	rm "$FIXTURE/alpha/child.txt"
+	wait_pane_lacks 'child.txt' 15 "external delete of the hovered nested row"
+	log_has 'poll change'
+	hovered_is 'aa.txt' "the next visible survivor takes the deleted row's slot"
+	pane_has 'alpha' "the expanded parent survives"
+
+	snapshot external_delete_hovered_nested
+	assert_log_clean
+	stop_session
+}
+
+# External deletion of the last visible nested row: the expanded directory is
+# the final root entry, so its only child is the final row and there is no
+# forward survivor. The cursor must clamp back to the parent, not reset to the
+# first root row.
+scenario_external_delete_last_nested_clamp() {
+	new_env external_delete_last_nested_clamp
+	write_config true adopt
+	rm -rf "$FIXTURE"
+	mkdir -p "$FIXTURE/alpha" "$FIXTURE/zeta"
+	printf 'Z' >"$FIXTURE/zeta/only.txt"
+	launch "$FIXTURE"
+
+	hovered_is 'alpha'
+	send_key j
+	settle 0.4
+	hovered_is 'zeta'
+	send_key l
+	wait_pane_has 'only.txt' 10 "zeta expands"
+	send_key j
+	settle 0.4
+	hovered_is 'only.txt'
+	settle 2.0
+
+	rm "$FIXTURE/zeta/only.txt"
+	wait_pane_lacks 'only.txt' 15 "external delete of the last nested row"
+	log_has 'poll change'
+	hovered_is 'zeta' "with no forward survivor the cursor clamps to the parent"
+	pane_has 'zeta' "the emptied expanded parent stays expanded"
+
+	snapshot external_delete_last_nested_clamp
+	assert_log_clean
+	stop_session
+}
+
 # An external rename inside an expanded directory replaces the old row with the
 # new name.
 scenario_external_rename_file_deep() {

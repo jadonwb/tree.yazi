@@ -150,7 +150,9 @@ write_config_search() {
 
 # Extra keymaps for the per-root/tab persistence scenarios. `dest0` and `dest9`
 # are absolute cwd destinations (the fixture root and a second root); `[`/`]`
-# drive stock history back/forward and `t` opens a new tab in the current cwd.
+# drive stock history back/forward and `t` opens a new tab through the plugin's
+# tree-aware `tab_create` (tree cwd as an explicit target in tree mode, stock
+# smart tab otherwise).
 add_cd_keymaps() {
 	local dest0="$1" dest9="$2"
 	cat >>"$CFG/keymap.toml" <<TOML
@@ -173,7 +175,7 @@ run = "forward"
 
 [[mgr.prepend_keymap]]
 on = "t"
-run = "tab_create --current"
+run = "plugin tree tab_create"
 TOML
 }
 

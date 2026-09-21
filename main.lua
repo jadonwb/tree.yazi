@@ -232,16 +232,26 @@ end
 -- Pin the active tree tab's folder ordering to `none` while injected hierarchy
 -- is live, so the built-in sorter cannot interleave children among the root
 -- entries. The configured sort is captured on the tab itself, never globally.
+-- The live preference is re-checked on every call: a tab created with an
+-- explicit target does not clone the creator's pinned `none` pref (it starts
+-- from the configured sort) even though ensure_tab copies the creator's
+-- sort_saved, so an early return on sort_saved alone would leave that tab's
+-- live sorter reordering the injected rows.
 local function pin_sort_for(t)
-	if not t or t.sort_saved then
+	if not t then
 		return
 	end
 	if native_search_view() then
 		return
 	end
-	t.sort_saved = capture_sort()
-	ya.dbg("[tree-dbg] pinning sort_by=none (was ", tostring(t.sort_saved.by), ")")
-	ya.emit("sort", { by = "none" })
+	local live = capture_sort()
+	if not t.sort_saved then
+		t.sort_saved = live
+	end
+	if live.by ~= "none" then
+		ya.dbg("[tree-dbg] pinning sort_by=none (was ", tostring(live.by), ")")
+		ya.emit("sort", { by = "none" })
+	end
 end
 
 -- Restore a tab's configured sort preferences when it leaves tree mode.
@@ -794,6 +804,81 @@ local function reconcile_root()
 	ui.render()
 end
 
+-- A freshly activated tree tab starts with an empty expansion set and no
+-- captured root order. Yazi's folder load normally applies the configured sort,
+-- but when that configured sort is `none` (or was otherwise suppressed) the
+-- listing is left in raw read_dir order, and a pinned `none` sorter will not
+-- reorder it. Seed an explicit directories-first alphabetical root order from
+-- the folder's real depth-0 children and rebuild once, so the fresh listing is
+-- deterministic. Only when there is no captured order and nothing expanded;
+-- native provider Views and an unloaded (or empty) folder are skipped. Returns
+-- true when the folder rows were available to seed from.
+local function seed_root_order()
+	if native_search_view() then
+		return true
+	end
+	if M.root_order ~= nil or next(M.expanded) ~= nil then
+		return true
+	end
+	local cwd = cx.active.current.cwd
+	local files = {}
+	for _, f in ipairs(cx.active.current.files) do
+		local rel = f.url:strip_prefix(cwd)
+		local rs = rel and tostring(rel) or ""
+		if rs ~= "" and not rs:find("/", 1, true) then
+			files[#files + 1] = f
+		end
+	end
+	if #files == 0 then
+		return false
+	end
+	table.sort(files, function(a, b)
+		local ad = a.cha and a.cha.is_dir and true or false
+		local bd = b.cha and b.cha.is_dir and true or false
+		if ad ~= bd then
+			return ad
+		end
+		return tostring(a.name) < tostring(b.name)
+	end)
+	local order = {}
+	for i, f in ipairs(files) do
+		order[i] = tostring(f.url)
+	end
+	M.root_order = order
+	M.gen = M.gen + 1
+	ya.dbg("[tree-dbg] seeded root order; entries=", #order)
+	-- Pin here rather than in activate: the tab kept its configured sorter
+	-- until the seeded directories-first rows are ready. rebuild pins
+	-- synchronously before scheduling the injection.
+	rebuild(M.gen, nil)
+	return true
+end
+
+-- activate runs on the `tab` ember, before a newly created tab's folder has
+-- loaded; a same-cwd `tab_create` emits no `cd`, so the root rows are not yet
+-- available to seed from. Retry briefly from the async context until the folder
+-- is loaded (or the tab/root changed), then seed once.
+local seed_try = ya.sync(function(_, tab, root)
+	if M.active_tab ~= tab or tostring(cx.active.current.cwd) ~= root then
+		return true
+	end
+	if not active_tree() then
+		return true
+	end
+	return seed_root_order()
+end)
+
+local function schedule_seed(tab, root)
+	ya.async(function()
+		for _ = 1, 40 do
+			ya.sleep(0.05)
+			if seed_try(tab, root) then
+				return
+			end
+		end
+	end)
+end
+
 -- Forget `target` and every expanded directory inside its subtree, comparing
 -- cwd-relative paths so collapsing "a/b" never matches "a/bc".
 local function prune_expanded(target_str)
@@ -1211,6 +1296,25 @@ local poll_scope = ya.sync(function(_, token)
 	if h and h.cha and not h.cha.is_dir and relative_of(h):find("/", 1, true) then
 		hover_file = { url = tostring(h.url), mtime = h.cha.mtime, len = h.cha.len }
 	end
+	-- Pre-change visible flattened sequence and the hovered row's slot in it.
+	-- The rebuild's empty FilesOp part resets the native cursor, so the tick
+	-- reconstructs stock's slot-preserving focus from this snapshot instead of
+	-- relying on the post-rebuild cursor. Captured here, not at commit time: a
+	-- stock operation on an injected row can reset the Folder cursor between
+	-- this snapshot and the commit.
+	local visible = {}
+	local hover_idx = 0
+	local files = cx.active.current.files
+	for i = 1, #files do
+		local u = tostring(files[i].url)
+		visible[i] = u
+		if h and u == tostring(h.url) then
+			hover_idx = i
+		end
+	end
+	if hover_idx == 0 then
+		hover_idx = (cx.active.current.cursor or 0) + 1
+	end
 	return {
 		gen = M.gen,
 		tab = tab,
@@ -1218,10 +1322,8 @@ local poll_scope = ya.sync(function(_, token)
 		urls = urls,
 		sig = sig,
 		injecting = M.injecting,
-		-- Captured here, not at commit time: a stock operation on an injected
-		-- row can reset the Folder cursor between this snapshot and the commit,
-		-- and the pre-reset hover is the position the poll must preserve.
-		hover = h and tostring(h.url) or nil,
+		visible = visible,
+		hover_idx = hover_idx,
 		hover_file = hover_file,
 	}
 end)
@@ -1238,7 +1340,10 @@ end)
 -- rename the async scan resolved by directory identity. They are applied to the
 -- live and saved expansion state through the same remap/prune machinery the
 -- rename/remove events use, before the one rebuild that follows.
-local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, hover, dirty, moves, prunes)
+--
+-- Returns (rebuilt, empty_expansion): `empty_expansion` tells the poll loop to
+-- stop when this tick pruned the last live expansion key, mirroring M:left.
+local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, visible, hover_idx, dirty, moves, prunes)
 	if token ~= poll_token or not active_tree() then
 		return false
 	end
@@ -1286,20 +1391,40 @@ local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, hover, dirty,
 		)
 	end
 	M.gen = M.gen + 1
-	-- Focus the exact pre-change hover rather than reassert's filter-aware root
-	-- ancestor: the poll re-applies the same filter, so a hovered nested row that
-	-- was visible before the change is still visible after it, and collapsing the
-	-- focus to its root would move the cursor off it. A vanished hover is a
-	-- no-op in M:focus. A hover inside a moved subtree follows the directory.
-	local focus = hover
-	if focus and moves then
-		focus = remap_abs_bulk(moves, focus)
+	-- Stock's removal keeps the cursor's slot: a surviving hovered row stays,
+	-- else the next surviving row shifts up into the deleted slot, and only an
+	-- end-of-list delete clamps back to the previous row. The rebuild reset the
+	-- native cursor, so recreate that order over the pre-change visible sequence
+	-- and let M:focus resolve it against the rebuilt files, skipping any row
+	-- that vanished or is hidden by the active tree filter. An external move
+	-- remaps each candidate through the same map as the expansion keys.
+	local candidates, seen = {}, {}
+	local function add_candidate(u)
+		if u and not seen[u] then
+			seen[u] = true
+			candidates[#candidates + 1] = u
+		end
 	end
+	local function candidate_at(i)
+		local u = visible[i]
+		if u and moves then
+			u = remap_abs_bulk(moves, u)
+		end
+		return u
+	end
+	for i = hover_idx, #visible do
+		add_candidate(candidate_at(i))
+	end
+	for i = hover_idx - 1, 1, -1 do
+		add_candidate(candidate_at(i))
+	end
+	local focus = #candidates > 0 and candidates or nil
+	local empty_expansion = next(M.expanded) == nil
 	ya.dbg(
 		"[tree-dbg] poll change; gen=",
 		M.gen,
 		"focus=",
-		tostring(focus),
+		tostring(focus and focus[1]),
 		"moves=",
 		moves and count_keys(moves) or 0,
 		"prunes=",
@@ -1308,7 +1433,7 @@ local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, hover, dirty,
 	M.pending_focus = focus
 	ui.render()
 	rebuild(M.gen, focus)
-	return true
+	return true, empty_expansion
 end)
 
 -- Clear M.poller only if it still refers to the loop that just ended, so a
@@ -1497,7 +1622,13 @@ local function poll_tick(token)
 			dirty = true
 		end
 	end
-	poll_apply(token, scope.gen, scope.tab, scope.root, sig, scope.hover, dirty, moves, prunes)
+	local rebuilt, empty_expansion =
+		poll_apply(token, scope.gen, scope.tab, scope.root, sig, scope.visible, scope.hover_idx, dirty, moves, prunes)
+	-- The last live expansion key was pruned: end the loop instead of waking once
+	-- per interval for an empty scope. poll_finish clears the handle afterwards.
+	if rebuilt and empty_expansion then
+		return false
+	end
 	return true
 end
 
@@ -1725,6 +1856,24 @@ function M:root_down()
 	else
 		ya.emit("open", {})
 	end
+end
+
+-- t t: in tree mode a new tab always opens at the tree cwd, ignoring the hover.
+-- Stock `tab_create --current` passes target=None, so Yazi's TabCreate actor
+-- reveals the hovered URL; for a plugin-injected descendant that cds to the
+-- descendant's parent (for example `flavors` for `flavors/arrowlake-light.yazi`)
+-- instead of the tree root. Emitting the cwd as an explicit target takes the
+-- actor's target branch and never consults the hover. Outside tree mode (and in
+-- native fd/rg Views, where active_tree() is false) this re-emits the stock
+-- smart-tab behavior unchanged.
+function M:tab_create(args)
+	args = args or {}
+	if not active_tree() then
+		ya.emit("tab_create", { current = true })
+		return
+	end
+	ya.dbg("[tree-dbg] tab_create at tree cwd=", tostring(cx.active.current.cwd))
+	ya.emit("tab_create", { cx.active.current.cwd })
 end
 
 -- ---------------------------------------------------------------------------
@@ -2113,13 +2262,22 @@ local function activate(tab)
 	t.root = root
 	M.pending_focus, M.injected, M.injecting = nil, false, false
 	if t.tree then
-		pin_sort_for(t)
+		-- A fresh tree tab has no saved root entry yet, so its folder is still
+		-- loading. Pinning `none` now would force the first loaded frame to raw
+		-- read_dir order; leave the configured sorter in place and let
+		-- seed_root_order pin together with the injected directories-first rows.
+		if t.roots[root] ~= nil then
+			pin_sort_for(t)
+		end
 	else
 		restore_sort_for(t)
 	end
 	load_roots(t, root)
 	apply_active()
 	reconcile_root()
+	if t.tree and not seed_root_order() then
+		schedule_seed(tab, root)
+	end
 	prune_tabs()
 	if t.tree then
 		ensure_poller()
@@ -2546,6 +2704,8 @@ function M:entry(job)
 		M:root_up()
 	elseif action == "root_down" then
 		M:root_down()
+	elseif action == "tab_create" then
+		M:tab_create(args)
 	elseif action == "open" then
 		M:open()
 	elseif action == "create" then

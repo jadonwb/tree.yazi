@@ -1,16 +1,8 @@
--- URL/remap/prune and saved-root reconciliation helpers for the live tree. This
--- module owns the pure URL helpers and every per-tab/per-root remap, prune, and
--- saved-state operation. The live plugin state is reached only through the bound
--- accessor passed to bind() (installed once from main.lua's M:setup), so this
--- module never holds M -- the same no-M contract as events.lua and poller.lua.
--- The table accessors return the live references (never copies), so
--- prune_expanded and remap_expanded_prefix keep mutating the live expansion set
--- in place.
+-- URL/remap/prune and saved-root reconciliation helpers.
 
 local M = {}
 
--- Bound once by main.lua; every stateful helper below reads and writes the live
--- plugin state through these closures.
+-- Bound once by main.lua: S is the bound accessor into live plugin state.
 local S
 
 function M.bind(accessors)
@@ -131,11 +123,13 @@ function M.save_live(id)
 	local any = next(S.expanded()) ~= nil
 		or S.root_order() ~= nil
 		or (S.filter_query() ~= nil and S.filter_query() ~= "")
-	t.roots[t.root] = any and {
-		expanded = M.copy_set(S.expanded()),
-		order = M.copy_list(S.root_order()),
-		filter = S.filter_query(),
-	} or nil
+	t.roots[t.root] = any
+			and {
+				expanded = M.copy_set(S.expanded()),
+				order = M.copy_list(S.root_order()),
+				filter = S.filter_query(),
+			}
+		or nil
 end
 
 -- Load a tab's frozen root state into the live working set. A classic tab always

@@ -1,9 +1,5 @@
 --- @since 26.9.1
 --- @sync entry
---- State owner: this file holds M, the event subscriptions, and the sync
---- bridges; sibling modules are stateless helpers reached through them.
---- Live recursive tree: lazily expand/collapse directories at any depth in
---- place while keeping Yazi's native Folder cursor, hover, and file entities.
 
 local M = {}
 
@@ -143,13 +139,8 @@ end
 
 -- Native filtering is suspended for the whole injected-tree lifetime: a live
 -- Entries filter is re-applied to every injected row and can orphan a child
--- from a hidden parent. The raw query is kept on the owning tab (t.suspended_filter)
--- so `suspend` can restore it and `adopt` can decide whether to hand the tree
--- query back, without bleeding between tabs.
--- How a native filter is transferred into (and out of) tree mode:
--- "adopt"   - apply it as the hierarchy-aware query, restore it on exit;
--- "suspend" - hide its effect while tree mode is on, restore it on exit;
--- "clear"   - discard it for good.
+-- from a hidden parent. The raw query is kept on the owning tab
+-- (t.suspended_filter) so it can be restored without bleeding between tabs.
 local filter_mode = "adopt"
 
 -- Injection tickets must never collide with the folder loader's own tickets,
@@ -348,15 +339,6 @@ local function is_regular(cha)
 	)
 end
 
--- ---------------------------------------------------------------------------
--- Native filter hand-off. Yazi's own Entries filter is a regex applied to every
--- injected row by Entries::split_files, so a live native filter would
--- double-filter the tree and can hide an ancestor while keeping its child.
--- Before any injection the plugin takes ownership: read the raw native query,
--- clear native filtering through `filter_do`, then adopt it into
--- hierarchy-aware matching, suspend it for later restore, or discard it.
--- ---------------------------------------------------------------------------
-
 -- Transfer any live native filter. Idempotent: once cleared, the Folder reports
 -- no filter and later calls are no-ops for the rest of the tree-mode session.
 -- Returns true when a query was taken over.
@@ -401,11 +383,6 @@ local function restore_native_filter(query)
 		ya.dbg("[tree-dbg] native filter not restored; mode=", filter_mode)
 	end
 end
-
--- ---------------------------------------------------------------------------
--- Rebuild: async read of the root and every expanded directory, then a single
--- FilesOp reset + append + done injection into the active Folder.
--- ---------------------------------------------------------------------------
 
 -- Stale guard: the async callback must not reset a folder owned by a newer
 -- generation, and it must still belong to the tab it was captured for, because
@@ -621,13 +598,9 @@ local function rebuild(gen, focus_str, pin)
 	end)
 end
 
--- ---------------------------------------------------------------------------
--- Header indication: Yazi's stock Header renders "(filter: query)" solely from
--- the native Entries filter, which the plugin keeps cleared while it owns
--- hierarchy-aware filtering. Conditionally wrap Header:flags so the active tree
--- query shows beside the cwd in the stock style/placement; every other case
--- (tree mode off, no tree query) delegates to the untouched renderer.
--- ---------------------------------------------------------------------------
+-- Header indication: the wrapped Header:flags delegates to the untouched stock
+-- renderer whenever tree mode is off or no tree query is live, and otherwise
+-- feeds it the plugin-owned query.
 
 local function install_header_filter()
 	if saved_header_flags or not (Header and Header.flags) then
@@ -652,12 +625,6 @@ end
 local function hovered()
 	return cx.active.current.hovered
 end
-
--- ---------------------------------------------------------------------------
--- Row metadata. The per-tab/per-root save, load, remap, and prune helpers live
--- in roots.lua behind the bound accessor; the row rehydration this file runs in
--- place reads cx directly in rows.lua.
--- ---------------------------------------------------------------------------
 
 -- Synchronously strip restored descendant rows when the live expansion set is
 -- empty. Emits the same part/part/done sequence rebuild uses; rows.lua reuses
@@ -785,12 +752,6 @@ end)
 -- Deletion/transfer reconciliation lives in events.lua; the per-root prune
 -- helpers it calls are in roots.lua.
 
--- ---------------------------------------------------------------------------
--- Mutation-event domain controller. events.lua owns the rename/remove/transfer
--- reconciliation policy; every read and write of M stays in main.lua behind
--- these bounded operations, so the module never holds the state table.
--- ---------------------------------------------------------------------------
-
 -- True when `url_str` is the active tree root or an expanded directory: the two
 -- places where a created/removed/transferred child becomes a visible row.
 local function is_tree_parent(url_str)
@@ -815,18 +776,6 @@ local function commit_mutation(focus, new_expanded, new_root_order)
 	ui.render()
 	rebuild(M.gen, focus)
 end
-
--- ---------------------------------------------------------------------------
--- External-change polling. Yazi's watcher only covers the active tab's current,
--- parent, and hovered folders non-recursively, so a mutation inside an expanded
--- directory at depth >= 1 never reaches the injected rows. The plugin keeps one
--- bounded poll loop alive for the active physical tree session: once per tick it
--- reads unfollowed metadata for each currently expanded directory and coalesces
--- any change, disappearance, or read failure into a single existing
--- generation-guarded rebuild. Collapsed subtrees, inactive saved roots, and
--- native fd/rg provider Views are never polled, and the plugin deliberately
--- does not touch the undocumented `watch`/`load` internals.
--- ---------------------------------------------------------------------------
 
 -- Identity of the newest poll session. Bumping it makes any older loop exit or
 -- drop its result at the next scope/commit check, so a handle captured before a
@@ -1269,14 +1218,6 @@ function M:tab_create(args)
 	ya.emit("tab_create", { cx.active.current.cwd })
 end
 
--- ---------------------------------------------------------------------------
--- Target-aware create. Stock create always joins the typed name to the active
--- cwd and then reveals (a cd whenever the target parent differs from cwd), so a
--- hovered directory or injected child cannot be delegated to it. The plugin
--- reproduces the prompt and filesystem work without ever changing cwd, then
--- rebuilds the expanded hierarchy so the new row is injected in place.
--- ---------------------------------------------------------------------------
-
 -- Sync-side completion: only rebuild when the root is unchanged and the target
 -- is part of the injected hierarchy (or rows are already injected), so a
 -- watcher-driven Full reload cannot leave injected rows stale.
@@ -1341,14 +1282,6 @@ function M:create(args)
 		})
 	end)
 end
-
--- ---------------------------------------------------------------------------
--- Target-aware paste. Native yank/cut already work on injected rows, so only
--- the destination needs redirecting. Stock paste always uses tab.cwd(), so a
--- non-cwd destination reproduces it through Yazi's own copy/move tasks; the
--- scheduler keeps unique-name/force behavior, task progress, hooks, watcher
--- reports, and duplicate/move DDS events identical to stock.
--- ---------------------------------------------------------------------------
 
 -- p / P: paste into the hovered tree level. A cwd destination (root-level file,
 -- or no hover) delegates to stock paste for exact parity; otherwise every
@@ -1482,13 +1415,9 @@ function M:focus()
 	end
 end
 
--- ---------------------------------------------------------------------------
--- Tree-aware filtering. Yazi's native filter has no event or preflight hook and
--- matches the full urn, so it cannot keep injected descendants attached to
--- their parents. The plugin owns the query instead: it rebuilds the real
--- Entries subset (Yazi's own `entries.filter` stays nil) so rendered rows,
--- Folder cursor, hover, selection, and operations stay aligned.
--- ---------------------------------------------------------------------------
+-- Tree-aware filtering: Yazi's native filter has no event/preflight hook and
+-- cannot keep injected descendants attached to their parents, so the plugin
+-- owns the query.
 
 -- Rebuild after an event-free external change (hidden toggle, realtime filter).
 function M:reassert()
@@ -1573,11 +1502,6 @@ function M:escape()
 	end
 	ya.emit("escape", {})
 end
-
--- ---------------------------------------------------------------------------
--- cwd/root change: save the outgoing root's live state and restore the incoming
--- root's saved state (or an empty one), then make rows and state agree.
--- ---------------------------------------------------------------------------
 
 -- Seed a newly observed tab. Tabs created by tab_create inherit the creating
 -- tab's tree/preview modes and, when the creator is a tree tab with a saved

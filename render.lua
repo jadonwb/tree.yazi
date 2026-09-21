@@ -1,6 +1,4 @@
--- Tree-row rendering primitives and connector configuration. Loaded by the
--- plugin's setup(); the private render style and resolved glyph state live here
--- so main.lua only reads them through style()/glyphs().
+-- Tree-row rendering primitives and connector configuration.
 
 local M = {}
 

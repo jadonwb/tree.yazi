@@ -1,8 +1,4 @@
--- Asynchronous rebuild + FilesOp injection pass for the tree plugin: reads the
--- expanded subtrees, flattens and filters them in the captured root order,
--- publishes row metadata, and injects the resulting rows. Mutable plugin state
--- stays owned by main.lua; this module reaches it only through the guarded
--- generation/tab bridges passed in ctx.
+-- Async rebuild and FilesOp injection pass.
 
 local M = {}
 

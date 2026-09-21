@@ -1,9 +1,4 @@
--- Plugin-initiated, keymap-driven filesystem writes: the target-aware create
--- and nested rename passes. Each pass is loaded lazily from inside its own
--- existing ya.async callback and receives only its captured primitive inputs
--- plus the single reconciliation bridge it hands results back to; mutable
--- plugin state stays owned by main.lua. Compare events.lua, which reconciles
--- mutations the plugin did not perform.
+-- Plugin-initiated filesystem writes (target-aware create, nested rename).
 
 local M = {}
 

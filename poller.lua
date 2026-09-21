@@ -1,13 +1,4 @@
--- Setup-installed external-change poll loop: the bounded per-tick metadata
--- scan and the one coalesced, generation-guarded rebuild that it drives through
--- the apply bridge. This
--- module owns the poll interval, the (dev, btime) directory-identity helper
--- `dir_identity`, the bounded identity scan `poll_scan`, the per-tick
--- stat/compare `poll_tick`, and the async loop itself. Every read and write of
--- the plugin's mutable state goes through the bounded controller passed to
--- start() (scope/apply/finish are main.lua's ya.sync bridges), so this module
--- never holds M. Compare events.lua's bind() and rebuild.lua's run(): the same
--- no-M contract.
+-- Setup-installed external-change poll loop.
 
 local M = {}
 

@@ -1,7 +1,4 @@
--- Cursor/row helpers over the active `cx` folder. Loaded by the plugin's
--- setup(); these read the live `cx.active.current` folder (like events.lua) and
--- return values rather than holding plugin state, so main.lua stays the state
--- owner and keeps the reconcile/seed/strip orchestration.
+-- Cursor/row helpers over the active `cx` folder.
 
 local M = {}
 

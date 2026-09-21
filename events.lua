@@ -1,9 +1,4 @@
--- Setup-installed reconciliation policy for externally-initiated filesystem
--- mutation events: rename/bulk-rename and remove/transfer. The handlers are
--- plain synchronous functions subscribed by main.lua with ps.sub; every read
--- and write of the plugin's mutable state stays behind the bounded controller
--- passed to bind(), so this module never performs filesystem writes and never
--- holds M. Compare operations.lua, which performs the plugin's own writes.
+-- Reconciliation policy for externally-initiated mutation events.
 
 local M = {}
 

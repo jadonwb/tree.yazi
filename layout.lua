@@ -1,11 +1,4 @@
--- Layout/ratio and per-tab sort handoff for the live tree. This module owns the
--- canonical base ratio captured from rt.mgr.ratio while the active tab is idle
--- (tree off, preview on), the effective-ratio composition of the active tab's
--- own modes, the single writer of rt.mgr.ratio plus its app:resize reflow, and
--- the capture/pin/restore of a tab's configured sort while injected hierarchy is
--- live. The tab record and tab preferences are reached only through the bound
--- accessor passed to bind() (installed once from main.lua's M:setup), so this
--- module never holds M -- the same no-M contract as roots.lua/events.lua.
+-- Layout/ratio and per-tab sort handoff.
 
 local M = {}
 

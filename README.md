@@ -653,10 +653,53 @@ asynchronous rebuild that reads the expanded subtrees, flattens and filters them
 in the captured root order, publishes row metadata, and injects the resulting
 rows; `render.lua` holds the row-rendering primitives, connector configuration,
 private render style, and resolved glyph state; `flatten.lua` is the pure
-directory-first ordering and smart-case literal matching used by the flatten
-pass; and `poller.lua` is the setup-installed external-change loop whose bounded
-per-tick metadata scan drives one coalesced, generation-guarded rebuild through
-the apply bridge.
+directory-first ordering, the smart-case literal matching, and the Lua port of
+Yazi's natural sort with its frozen FNV-1a random comparator used by the flatten
+pass; `translit.lua` is the lazily loaded port of Yazi's translit table, used
+only for natural sort with `translit` true; and `poller.lua` is the
+setup-installed external-change loop whose bounded per-tick metadata scan drives
+one coalesced, generation-guarded rebuild through the apply bridge.
+
+### Module contracts and state ownership
+
+`main.lua` owns the live state for the active tab: `M.expanded`, `M.rows`,
+`M.root_order`, and `M.filter_query`. Everything that must survive a tab switch
+lives on `M.tabs[tab_id]` — the tab's tree/preview modes, its sort and
+native-filter handoff, its last-seen root, its frozen `random_seed`, and its
+per-root `roots[root] = { expanded, order, filter }` map. Entering a tab loads
+its saved state and leaving one saves it; Yazi restores a whole cached Folder on
+`cd`, and `update_files` always targets the active tab, so the plugin saves the
+outgoing tab itself and reconciles the incoming one against its saved set.
+
+Sibling modules never hold `M`. Each reaches live state through a bound
+accessor installed once from `M:setup`: `roots.bind(accessors)`, `layout.bind`,
+`events.bind(ctl)`, `poller.start(token, ctx)`, and `render.install(caps)`;
+`rows.lua` reads `cx` directly and returns values, and `render.lua`'s private
+style and resolved glyphs are read back only through `style()`/`glyphs()`. The
+bound accessors expose the live tables (not copies), so the in-place
+`prune`/`remap` helpers mutate the live expansion set, and `events.lua` performs
+no filesystem writes — the plugin's own writes live in `operations.lua`.
+
+Async passes are resolved lazily: each is `require`d inside its own existing
+`ya.async` callback, or bound once in `setup()` from the async `init.lua`
+context, so no module is loaded on a synchronous path that cannot require it.
+
+A completed rebuild injects one `FilesOp` sequence — `part` (empty) + `part`
+(the rows) + `done` — under a ticket taken from `M.seq`, which starts above the
+folder loader's own tickets. Before injection the rebuild stashes a plain-table
+replay snapshot (`inject_snapshot`/`inject_cwd`/`inject_tab`/`has_descendants`);
+the synchronous `on_load` repair replays it (rebuilding fresh `File` userdata,
+since `Stat`/`Path` userdata cannot cross the sync bridge) only when it recorded
+`depth > 0` rows. Every `set_*` bridge and `finish_rebuild` is gated on
+generation and tab, so a stale or cross-tab callback cannot reset a folder.
+
+`M.pending_focus` is either a URL string or an ordered candidate list; `M:focus`
+resolves it against the rebuilt files, skipping a fallback hidden by the active
+tree filter. The plugin owns `M.filter_query` and keeps Yazi's native `Entries`
+filter cleared for the whole injected-tree lifetime, with the raw query parked
+per tab in `t.suspended_filter`. Poll sessions carry an identity
+(`poll_token`/`M.poller_token`): a newer session makes an older loop drop its
+tick, and abort/finish clears the snapshot.
 
 ### Native fd/rg search views
 

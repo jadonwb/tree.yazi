@@ -3,8 +3,7 @@
 -- non-identity mappings of the three static table ranges are kept (508 of the
 -- 744 entries); an unmapped code point is passed through unchanged, matching
 -- `lookup` returning None, and ASCII is copied verbatim. Invalid UTF-8 emits
--- U+FFFD, like the Rust `utf8_chunks` walk. Applied only to `natural` sorting
--- when the captured `translit` preference is true.
+-- U+FFFD, like the Rust `utf8_chunks` walk.
 
 local M = {}
 

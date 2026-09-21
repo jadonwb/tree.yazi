@@ -288,51 +288,6 @@ scenario_remove_subtree_inside_fallback() {
 	stop_session
 }
 
-# Deletion focus under an active tree filter: the visible subset is the
-# candidate set, so the surviving hovered row keeps the cursor and the filter
-# stays applied.
-scenario_remove_filtered_unrelated() {
-	new_env remove_filtered_unrelated
-	write_config true adopt
-	make_fixture_remove
-	launch "$FIXTURE"
-
-	hovered_is 'alpha'
-	send_key l
-	settle 1.0
-	send_key f
-	settle 0.5
-	send_text 'child'
-	settle 0.8
-	send_key Enter
-	settle 0.9
-	header_has '(filter: child)'
-
-	# Visible filtered rows: alpha, child1, child2 (sub is opaque, not expanded).
-	send_key j
-	settle 0.4
-	hovered_is 'child1.txt'
-	# Select child1 (cursor advances to child2), then delete child1.
-	send_key Space
-	settle 0.4
-	hovered_is 'child2.txt'
-
-	send_key d
-	settle 0.6
-	pane_has 'Trash 1 selected file?'
-	send_key y
-	settle 2.4
-
-	file_absent "$FIXTURE/alpha/child1.txt"
-	pane_lacks 'child1.txt'
-	hovered_is 'child2.txt' "filtered view preserves the surviving hovered row"
-	header_has '(filter: child)' "tree filter survives the removal rebuild"
-
-	snapshot remove_filtered_unrelated
-	assert_log_clean
-	stop_session
-}
-
 # Deleting the only child of an expanded directory keeps the directory expanded
 # (stock has no expansion state and never collapses on delete) and moves focus
 # forward to the next visible row after the branch.

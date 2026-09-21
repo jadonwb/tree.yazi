@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
 # Navigation scenario suite
 #
-# Startup shape, lazy expand/collapse at arbitrary depth, symlink rows, and
-# cwd re-rooting.
+# Startup shape, lazy expand/collapse at arbitrary depth, symlink rows, cwd
+# re-rooting, hidden-subtree suppression, and rendering styles/glyphs.
 # Sourced by integration.sh after harness.sh; definitions only (never executed).
 # ---------------------------------------------------------------------------
 
@@ -71,6 +71,120 @@ scenario_expand_collapse() {
 	capture | tail -n 1 | grep -qF '1/3' || fail "status position should be 1/3 after collapse"
 
 	snapshot expand_collapse
+	assert_log_clean
+	stop_session
+}
+
+# Hidden-toggle subtree suppression: while hidden files are off, a hidden
+# directory and its entire injected subtree are suppressed (no orphaned child
+# left behind by native per-entry filtering), while the saved expansion is
+# preserved so re-showing hidden restores both rows.
+scenario_hidden_toggle_subtree() {
+	new_env hidden_toggle_subtree
+	write_config true adopt
+	add_hidden_keymap
+	make_fixture_hidden
+	launch "$FIXTURE"
+
+	# Hidden off at launch: the dotfile directory and its child are absent.
+	pane_lacks '.hidden' "hidden directory absent while hidden is off"
+	pane_lacks 'child.txt' "hidden subtree absent while hidden is off"
+	pane_has 'keep'
+	pane_has 'plain.txt'
+
+	# Show hidden, expand `.hidden` (it sorts before `keep`), assert its child.
+	send_key C-h
+	settle 0.9
+	pane_has '.hidden' "hidden directory appears once shown"
+	# `.hidden` sorts first, so the toggle leaves the cursor on it.
+	hovered_is '.hidden' "cursor lands on the shown hidden directory"
+	send_key l
+	settle 1.0
+	pane_has 'child.txt' "expanded hidden child renders"
+
+	# Hide again: the expanded hidden directory must take its whole subtree with
+	# it, and the visible siblings must remain.
+	send_key C-h
+	settle 0.9
+	pane_lacks '.hidden' "hidden directory suppressed on re-hide"
+	pane_lacks 'child.txt' "expanded hidden child suppressed with its parent"
+	pane_has 'keep'
+	pane_has 'plain.txt'
+
+	# Show once more: the preserved expansion restores both rows.
+	send_key C-h
+	settle 0.9
+	pane_has '.hidden' "hidden directory restored on re-show"
+	pane_has 'child.txt' "expansion preserved across the hide/show cycle"
+
+	snapshot hidden_toggle_subtree
+	assert_log_clean
+	stop_session
+}
+
+# style = "indent": the injected child is prefixed with plain repeated spaces
+# instead of connector glyphs, and the tree still expands, hovers, and collapses.
+scenario_render_indent() {
+	new_env render_indent
+	write_config_render indent ""
+	make_fixture
+	launch "$FIXTURE"
+
+	hovered_is 'alpha' "initial cursor"
+	send_key l
+	settle 0.9
+	pane_has 'child.txt' "expanded child renders in indent style"
+	# Depth-1 prefix is DEFAULT_GLYPHS.space ("   "), so the child row starts
+	# with three spaces and no branch/last connector glyph appears at all.
+	pane_matches '^   .*child\.txt' "injected child is indented with plain spaces"
+	pane_lacks '├─' "no branch connector in indent style"
+	pane_lacks '└─' "no last connector in indent style"
+
+	send_key j
+	settle 0.4
+	hovered_is 'child.txt' "indent rows still take the cursor"
+	capture | tail -n 1 | grep -qF '2/4' || fail "status position should be 2/4 on the child"
+
+	send_key h
+	settle 0.9
+	hovered_is 'alpha' "indent rows still collapse onto the parent"
+	pane_lacks 'child.txt'
+	log_has 'render style=.*indent'
+
+	snapshot render_indent
+	assert_log_clean
+	stop_session
+}
+
+# glyphs overrides: an equal-width custom set is applied to every connector; a
+# set whose widths differ is ignored wholesale so the defaults still render.
+scenario_glyphs_override() {
+	new_env glyphs_override
+	write_config_render lines '{ branch = " > ", last = " > ", vertical = " | ", space = "   " }'
+	make_fixture
+	launch "$FIXTURE"
+
+	hovered_is 'alpha' "initial cursor"
+	send_key l
+	settle 0.9
+	pane_has 'child.txt' "expanded child renders under custom glyphs"
+	pane_has ' > ' "equal-width custom branch glyph renders"
+	pane_lacks '└─' "custom glyphs replace the default last connector"
+
+	# Inconsistent widths (branch is 2 cells, the rest 3) are rejected as a
+	# set, so the resolver keeps DEFAULT_GLYPHS.
+	stop_session
+	write_config_render lines '{ branch = " >", last = " > ", vertical = " | ", space = "   " }'
+	launch "$FIXTURE"
+	hovered_is 'alpha' "initial cursor after relaunch"
+	send_key l
+	settle 0.9
+	pane_has 'child.txt' "expanded child renders under fallback glyphs"
+	pane_has '└─' "inconsistent custom glyph widths fall back to the defaults"
+	pane_lacks ' > ' "invalid custom glyphs are not applied"
+	log_has 'ignoring glyph overrides'
+
+	snapshot glyphs_override
 	assert_log_clean
 	stop_session
 }

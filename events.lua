@@ -1,24 +1,14 @@
--- Setup-installed filesystem mutation event reconciliation: rename/bulk-rename
--- and remove/transfer. The handlers are plain synchronous functions subscribed
--- by main.lua with ps.sub; every read and write of the plugin's mutable state
--- stays behind the bounded controller passed to bind(), so this module never
--- holds M.
+-- Setup-installed reconciliation policy for externally-initiated filesystem
+-- mutation events: rename/bulk-rename and remove/transfer. The handlers are
+-- plain synchronous functions subscribed by main.lua with ps.sub; every read
+-- and write of the plugin's mutable state stays behind the bounded controller
+-- passed to bind(), so this module never performs filesystem writes and never
+-- holds M. Compare operations.lua, which performs the plugin's own writes.
 
 local M = {}
 
--- Absolute-URL, path-boundary-safe subtree test shared by the event helpers.
-local function url_in_subtree(url_str, root_str)
-	return url_str == root_str or url_str:sub(1, #root_str + 1) == root_str .. "/"
-end
-
-local function in_any_subtree(url_str, roots)
-	for _, r in ipairs(roots) do
-		if url_in_subtree(url_str, r) then
-			return true
-		end
-	end
-	return false
-end
+-- Absolute-URL, path-boundary-safe subtree tests come from the controller
+-- (ctl.in_any_subtree, backed by roots.lua).
 
 -- `rename` carries the originating tab id; nil means the event has no tab scope.
 local function same_tab(tab)
@@ -56,7 +46,7 @@ local function rename_one(ctl, from_str, to_str)
 	-- A rename inside an expanded subtree changes visible child rows even when
 	-- no controlled key itself moved.
 	for _, root in ipairs(ctl.expanded_keys()) do
-		if url_in_subtree(from_str, root) or url_in_subtree(to_str, root) then
+		if ctl.in_any_subtree(from_str, { root }) or ctl.in_any_subtree(to_str, { root }) then
 			affected = true
 			break
 		end
@@ -226,7 +216,7 @@ local function on_bulk_rename(ctl, payload)
 	if not touched then
 		for from_str, to_str in pairs(map) do
 			for _, root in ipairs(ctl.expanded_keys()) do
-				if url_in_subtree(from_str, root) or url_in_subtree(to_str, root) then
+				if ctl.in_any_subtree(from_str, { root }) or ctl.in_any_subtree(to_str, { root }) then
 					touched = true
 					break
 				end
@@ -337,7 +327,7 @@ local function on_remove(ctl, kind)
 			idx = (cx.active.current.cursor or 0) + 1
 		end
 		local function survivor(u)
-			return ctl.rel_of(u) ~= nil and not in_any_subtree(u, all_removed)
+			return ctl.rel_of(u) ~= nil and not ctl.in_any_subtree(u, all_removed)
 		end
 		for i = idx, #files do
 			local u = tostring(files[i].url)

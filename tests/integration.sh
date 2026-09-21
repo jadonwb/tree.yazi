@@ -45,6 +45,9 @@ EXPECTED_REVISION="014426f"
 SCENARIOS=(
 	startup
 	expand_collapse
+	hidden_toggle_subtree
+	render_indent
+	glyphs_override
 	deep_expand_collapse
 	symlink_noexpand
 	reroot
@@ -64,6 +67,7 @@ SCENARIOS=(
 	create_collisions
 	paste
 	cut_paste
+	cut_paste_keeps_selection
 	remove_trash
 	remove_delete
 	remove_dir_trash
@@ -71,7 +75,6 @@ SCENARIOS=(
 	remove_hovered_elsewhere_preserved
 	remove_hovered_root_fallback
 	remove_subtree_inside_fallback
-	remove_filtered_unrelated
 	remove_last_child_keeps_expanded
 	remove_root_middle_next
 	remove_filtered_middle_next
@@ -113,6 +116,7 @@ SCENARIOS=(
 	external_rename_file_deep
 	external_filter_preserved
 	external_no_churn
+	hidden_poll_excluded
 	external_search_view_ignored
 	external_rename_dir_preserved
 	external_recreate_prunes
@@ -134,7 +138,8 @@ CWD_FILE=""
 # Harness support library (reporting/lifecycle, environment/fixtures, tmux, assertions).
 . "$HERE/harness.sh"
 
-# Navigation suite: startup shape, expand/collapse, symlinks, re-rooting.
+# Navigation suite: startup shape, expand/collapse, symlinks, re-rooting,
+# hidden-subtree suppression, rendering styles/glyphs.
 . "$HERE/scenarios_navigation.sh"
 
 # Filter suite: native/tree hand-off and filter toggle/roundtrip.

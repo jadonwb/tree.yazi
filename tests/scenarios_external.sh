@@ -236,6 +236,53 @@ scenario_external_no_churn() {
 	stop_session
 }
 
+# A hidden subtree is an unread boundary while hidden files are off: once an
+# expanded `.hidden` directory is hidden, the poller must drop its whole subtree
+# from the scoped keys, so an external change inside it drives no rebuild. The
+# retained expansion is restored on re-show, when the poll resumes and surfaces
+# the external child.
+scenario_hidden_poll_excluded() {
+	new_env hidden_poll_excluded
+	write_config true adopt
+	add_hidden_keymap
+	make_fixture_hidden
+	launch "$FIXTURE"
+
+	# Show hidden and expand `.hidden`; let the poller record its baseline.
+	send_key C-h
+	settle 0.9
+	pane_has '.hidden' "hidden directory appears once shown"
+	hovered_is '.hidden' "cursor lands on the shown hidden directory"
+	send_key l
+	wait_pane_has 'child.txt' 10 "hidden directory expands"
+	settle 2.0
+
+	# Hide it: the expanded subtree leaves the visible rows and the poll scope.
+	send_key C-h
+	settle 2.0
+	pane_lacks '.hidden' "hidden directory suppressed on re-hide"
+	pane_lacks 'child.txt' "hidden subtree suppressed with its parent"
+
+	local n0
+	n0="$(rebuild_count)"
+
+	# Mutate the hidden subtree externally. If it were still polled, the
+	# changed directory mtime would drive a rebuild.
+	printf 'EXTERNAL' >"$FIXTURE/.hidden/external.txt"
+	settle 3.5
+	[ "$(rebuild_count)" = "$n0" ] ||
+		fail "hidden subtree was polled while hidden ($n0 -> $(rebuild_count))"
+
+	# Show hidden again: the retained expansion resumes the read/poll and the
+	# external child appears.
+	send_key C-h
+	wait_pane_has 'external.txt' 15 "external child surfaces once hidden is shown again"
+
+	snapshot hidden_poll_excluded
+	assert_log_clean
+	stop_session
+}
+
 # A native fd/rg provider View owns its Folder: while it is active the poll loop
 # is stopped, an external mutation underneath is ignored (no rebuild, no
 # injected tree rows), and the provider rows are untouched.

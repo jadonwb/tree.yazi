@@ -69,9 +69,10 @@ Expansion is lazy and recursive: only directories you explicitly expand are
 read, and only directories reachable through an expanded ancestor are read, so
 an expansion buried under a collapsed parent costs no I/O. Each directory is
 read with Yazi's asynchronous `fs.read_dir` and its children are ordered
-directories-first, then alphabetically, independently at every level. Reads are
-uncapped: there is no per-directory entry limit, so a very large expanded
-directory reads all of its entries on every rebuild.
+directories-first, then alphabetically, independently at every level. `fs.read_dir`
+supports `options.limit` (unlimited by default) and `glob`, but the plugin
+deliberately reads without a limit, so a very large expanded directory reads all
+of its entries on every rebuild.
 
 Expansion works on the current directory's real folder entries at any depth:
 
@@ -140,7 +141,9 @@ still not resurrect its old path when revisited. Live-state remap and the
 follow-up rebuild apply only to the active tree tab. Bulk rename resolves each
 key against the untouched old-to-new map, so swaps and chains stay
 order-independent. Toggling hidden files schedules a rebuild after the actor, so
-hidden entries are re-split without flattening the injected hierarchy.
+hidden entries are re-split: while hidden is off a hidden directory suppresses
+its whole injected subtree (no child outlives its hidden parent), the expansion
+is kept, and the poller skips that subtree until hidden is shown again.
 
 `r` is routed through the plugin. Outside tree mode, when the hovered row is a
 depth-0 entry, or when there is an active native multi-selection, it re-emits
@@ -188,7 +191,9 @@ current, parent, and hovered folders, so a mutation inside an expanded directory
 at depth 1 or deeper never reaches the injected rows. While the active tab is a
 physical tree, the plugin therefore runs one bounded poll loop: once per second
 it reads unfollowed metadata (`fs.cha`) for every currently expanded directory
-and compares a compact `{ mtime, is_dir, dev, btime }` signature against its
+that is not inside a hidden subtree (while hidden files are off a hidden
+directory's whole subtree is skipped), and compares a compact
+`{ mtime, is_dir, dev, btime }` signature against its
 last successful snapshot. A changed mtime, a disappeared directory, a directory
 replaced by a different `(dev, btime)` identity or by a non-directory, or an
 unreadable one coalesces into a single existing generation-checked rebuild with
@@ -290,8 +295,10 @@ are created.
 Collision handling differs by type, and create never uses the trash:
 
 - An existing **regular file** is overwritten by `fs.write` (create+truncate) in
-  place: no unlink, no missing-path window, and the inode is preserved.
-  Declining the confirm leaves the file untouched; `--force` skips the confirm.
+  place: no unlink, no missing-path window, and the inode is preserved. This is
+  an intentional divergence from stock create, which unlinks the destination and
+  recreates it (casefold-aware, `yazi-actor/src/mgr/create.rs`). Declining the
+  confirm leaves the file untouched; `--force` skips the confirm.
 - An existing **directory** can never be replaced by an empty file, so it is a
   clean failure with an error notification (`... already exists as a directory`)
   instead of a confirm followed by an `EISDIR` error. The directory and its
@@ -320,9 +327,9 @@ plugin does not override them. `p` and `P` are routed through the plugin:
   instead. Note that forcing a directory copy onto an existing directory merges
   the trees rather than deleting entries that are absent from the source.
 - A cut paste clears the yank set with `unyank` after the moves are scheduled
-  and clears the active selection (`escape --select`) when one exists, since Lua
-  has no API to drop only the moved URLs from the selection. A copy paste
-  preserves the yank set, like stock.
+  and removes exactly the moved URLs from the active selection, leaving
+  unrelated selected entries intact. A copy paste preserves the yank set, like
+  stock.
 - Successful `duplicate` and `move` events trigger one generation-checked
   rebuild when either endpoint is the tree root or an expanded directory, so
   moved-away rows disappear and new children are injected under their parent.
@@ -349,7 +356,11 @@ position. Sort requests are captured through the `key-sort` preflight and forced
 to `by = none` in place, rather than relying on the one-shot pin, so the
 controlled ordering survives repeated sort attempts until tree mode exits.
 
-Custom sorting support (sxyazi/yazi#3382) has no implemented API yet.
+Custom sorting exists upstream (`SortBy::Custom`, with the `sort` action
+accepting `by = "custom"` and `fs.op("rank", { url, ranks })` plus
+`update_files` injecting `FilesOp::Rank`), but the plugin does not use it yet:
+sort-aware tree ordering is deferred, and the controlled root order described
+above is the current behavior.
 
 ### Filtering
 
@@ -360,9 +371,9 @@ ancestor. Yazi also re-applies the native Entries filter to every injected row,
 so leaving it live while descendants are injected double-filters the view.
 Native filtering is therefore handed off to the plugin:
 
-- `f` opens a realtime input positioned top-center with the same width as Yazi's
-  stock filter popup, and rebuilds the real Entries subset as you type
-  (debounced). The popup follows stock behavior: it always opens blank, uses the
+- `f` opens a realtime input positioned top-center, 50 cells wide, and rebuilds
+  the real Entries subset as you type (debounced). The popup follows stock
+  behavior: it always opens blank, uses the
   shared filter input name/history, keeps any active tree query applied until
   the first realtime typed value replaces it, and applies each typed value live.
   Yazi's own `entries.filter` is deliberately left unset, so the rendered rows,
@@ -399,11 +410,8 @@ injection, cleared from Yazi's Entries, and handled according to `filter_mode`:
 | `suspend`         | saved and not applied, so the full tree shows | the saved pre-tree query is restored                      |
 | `clear`           | discarded permanently                         | nothing is restored                                       |
 
-Set it in `~/.config/yazi/init.lua`:
-
-```lua
-require("tree"):setup({ filter_mode = "suspend" }) -- "adopt" (default) | "suspend" | "clear"
-```
+Set `filter_mode` in `setup()` (see [Configuration](#configuration)): `adopt`
+(default), `suspend`, or `clear`.
 
 `adopt` keeps a single hierarchy-aware filtering pass and is the default. Yazi
 exposes only a filter's raw query string to plugins, not its case mode or regex,
@@ -433,11 +441,8 @@ indicator.
 
 ### Rendering styles
 
-Choose the prefix style in `~/.config/yazi/init.lua`:
-
-```lua
-require("tree"):setup({ style = "lines" })
-```
+Choose the prefix style with `style` in `setup()` (see
+[Configuration](#configuration)): `lines` (default) or `indent`.
 
 | `style`           | rendering                                              |
 | ----------------- | ------------------------------------------------------ |
@@ -449,17 +454,11 @@ three-cell indent step, so a depth-1 icon sits in the same column whether the
 prefix is a connector or a plain indent. `indent` keeps that depth spacing but
 draws no lines.
 
-Optional `glyphs` overrides replace individual connectors. Each glyph may be any
-width, but all four must share one width or the columns drift apart; an
-inconsistent or non-string set is ignored and the defaults are used. Missing
-keys fall back to the defaults, and the old wider forms still work as overrides:
-
-```lua
-require("tree"):setup({
-	style = "lines",
-	glyphs = { branch = " ├─", last = " └─", vertical = " │ ", space = "   " },
-})
-```
+Optional `glyphs` overrides (see [Configuration](#configuration)) replace
+individual connectors. Each glyph may be any width, but all four must share one
+width or the columns drift apart; an inconsistent or non-string set is ignored
+and the defaults are used. Missing keys fall back to the defaults, and the old
+wider forms still work as overrides.
 
 The chosen style and glyphs are logged once per enable, next to the other
 `[tree-dbg]` diagnostics.
@@ -472,14 +471,8 @@ unchanged; a directory matched by a more specific theme rule (for example a
 
 ### Per-launch startup
 
-`setup()` accepts an optional `startup` table to start a mode before the first
-frame, with no visible activation flicker:
-
-```lua
-require("tree"):setup({
-	startup = { tree = true, preview = false },
-})
-```
+The `startup` table (see [Configuration](#configuration)) starts a mode before
+the first frame, with no visible activation flicker.
 
 `startup.tree` defaults to `false` and `startup.preview` defaults to `true`, so
 omitting the `startup` table leaves Yazi's ordinary initial layout untouched.
@@ -526,16 +519,17 @@ normally afterwards.
   shown as a directory and can be entered with `Enter`/`L`, but `l` refuses to
   descend into it (logged at debug level) so a self-referential link cannot
   recurse forever. There is no follow mode and no inode-based cycle detection.
-- **Uncapped, uncached reads.** Each rebuild asynchronously re-reads the root
-  and every reachable expanded directory with no per-directory entry limit and
-  no children cache, so a rebuild's I/O is proportional to the total entries of
-  the expanded directories, not just the visible window.
+- **Unlimited, uncached reads.** Each rebuild asynchronously re-reads the root
+  and every reachable expanded directory without passing `fs.read_dir`'s
+  `options.limit` and with no children cache, so a rebuild's I/O is proportional
+  to the total entries of the expanded directories, not just the visible window.
 - **External changes below the root are polled, not watched.** Yazi's watcher
   only covers the current, parent, and hovered folders, non-recursively, and
   watcher ops for a nested trail never touch the injected rows. Instead the
   plugin runs its own bounded poll (see _External changes (bounded polling)_):
   once per second it reads unfollowed metadata for the active tab's expanded
-  directories and coalesces a real change into one guarded rebuild. Scope is
+  directories outside any hidden subtree while hidden is off, and coalesces a
+  real change into one guarded rebuild. Scope is
   strictly the active tab's expanded directories, so collapsed subtrees and
   saved roots of inactive tabs are never observed, and detection is delayed by
   up to roughly one interval plus a rebuild. An expanded directory renamed
@@ -556,9 +550,6 @@ normally afterwards.
 - **Target-aware link/hardlink is stock-only.** Yazi 26.9.1 exposes no Lua task
   kind or `fs` call for symlinks/hardlinks, so target-aware `link`/`hardlink`
   cannot be reproduced and those actions still use the current directory.
-- **Cut-paste selection clearing is coarser than stock.** Lua can only clear the
-  whole active selection (`escape --select`), not just the moved URLs, so a cut
-  paste that had an active selection clears all of it.
 - **Filter matching is literal, not regex.** The query is matched as a
   smart-case basename substring, so Yazi's regex `Normalizer` syntax and match
   highlighting do not apply.
@@ -587,6 +578,57 @@ normally afterwards.
 
 Compatible with Yazi 26.9.1. As with all Yazi plugins, compatibility is only
 guaranteed with the latest Yazi release.
+
+## Architecture
+
+`main.lua` is the state owner and orchestrator: it holds `M` (the expansion
+sets, row metadata, generation counters, per-tab records, and the poller
+handle), registers the event subscriptions, and defines the synchronous bridges
+that let the async passes touch that state. The sibling modules are stateless
+helpers reached through those bridges and never hold `M`: `roots.lua` does URL
+remap, prune, and saved-root reconciliation; `layout.lua` owns the canonical
+base ratio, the effective-ratio composition, the single write of `rt.mgr.ratio`,
+and the per-tab sort pin/restore handoff; `rows.lua` holds the cursor,
+cwd-relative, and row-rehydration helpers over the active `cx` folder;
+`events.lua` reconciles externally-initiated mutation events (`rename`/
+`bulk-rename`, remove/transfer); `operations.lua` performs the plugin-initiated
+writes (target-aware create and nested rename); `rebuild.lua` runs the
+asynchronous rebuild that reads the expanded subtrees, flattens and filters them
+in the captured root order, publishes row metadata, and injects the resulting
+rows; `render.lua` holds the row-rendering primitives, connector configuration,
+private render style, and resolved glyph state; `flatten.lua` is the pure
+directory-first ordering and smart-case literal matching used by the flatten
+pass; and `poller.lua` is the setup-installed external-change loop whose bounded
+per-tick metadata scan drives one coalesced, generation-guarded rebuild through
+the apply bridge.
+
+### Native fd/rg search views
+
+A native `fd://`/`rg://` provider View is never a tree View: `active_tree()`
+returns false for it regardless of the tab's recorded mode, so provider rows,
+stock rendering, stock actions, and the stock rebuild all delegate untouched.
+The mode is still recorded on the tab, and sort pin/restore is deferred to the
+next physical `cd`; stock EscapeView (which cds back to the physical root) is
+never intercepted, and the poll loop stops for the provider View and starts
+again on a physical tree.
+
+## Interoperability
+
+Yazi has no generic action-interception bus. `Actor::hook` returns a preflight
+kind only for a fixed set of events (`key-sort`, `key-hidden`, `key-close`,
+`key-quit`, `ind-sort`, `ind-hidden`, `ind-watch`, and a few others), and
+`paste`, `create`, `rename`, `link`, and `hardlink` are not among them. No plugin
+can preflight, redirect, or cancel those actions. A keybinding or another plugin
+that emits a stock action therefore runs against the active tab's cwd and
+bypasses tree routing entirely — `ya.emit("paste", ...)`, for example, pastes
+into the tab cwd, not into a hovered tree level.
+
+Tree.yazi does not attempt such interception. It reconciles mutations started
+elsewhere only through the post-hoc `rename`, `bulk-rename`, `trash`, `delete`,
+`duplicate`, and `move` DDS events, which remap or prune the relevant saved
+expansions; actions with no corresponding event are simply not routed into the
+tree. Cross-plugin calls can still use the documented `require("tree")` module, a
+DDS custom kind, or the `plugin` action.
 
 ## Installation
 
@@ -702,6 +744,44 @@ outer `plugin` action and drop it before the plugin sees it.
 
 Note that the keybindings above are just examples, please tune them up as needed
 to ensure they don't conflict with your other actions/plugins.
+
+## Configuration
+
+Call `setup()` once in your `~/.config/yazi/init.lua`. It accepts a single table
+with four optional keys; every key is independent, and omitting the table (or a
+key) keeps the documented default. This block is the single source of truth for
+every `setup()` option; the sections above only describe each option's behavior.
+
+```lua
+require("tree"):setup({
+	-- Prefix rendering for injected rows.
+	--   "lines"  (default) compact ancestor/branch connectors (` ├─`, ` └─`, `│`)
+	--   "indent" equal-width spaces with no visible lines
+	style = "lines",
+
+	-- Connector glyphs. Each may be any non-empty string, but all four must
+	-- share one display width or the whole set is ignored and the defaults are
+	-- used. Missing keys fall back to the defaults below.
+	glyphs = {
+		branch = " ├─",
+		last = " └─",
+		vertical = " │ ",
+		space = "   ",
+	},
+
+	-- What to do with a native filter that is active when tree mode starts.
+	--   "adopt"   (default) re-apply it as the hierarchy-aware tree query
+	--   "suspend" save it and restore it on leaving tree mode
+	--   "clear"   discard it permanently
+	filter_mode = "adopt",
+
+	-- State seeded into every tab the plugin first observes, before the first
+	-- frame.
+	--   tree    false (default) tree mode off
+	--   preview true  (default) preview pane on
+	startup = { tree = false, preview = true },
+})
+```
 
 ## Diagnostics
 

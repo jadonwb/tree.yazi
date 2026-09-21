@@ -24,6 +24,7 @@ function M.run(ctx)
 	local expanded = ctx.expanded
 	local root_order = ctx.root_order
 	local filter = ctx.filter
+	local show_hidden = ctx.show_hidden
 	local ticket = ctx.ticket
 	local injected = ctx.injected
 	local focus_str = ctx.focus_str
@@ -31,6 +32,7 @@ function M.run(ctx)
 	local set_root_order = ctx.set_root_order
 	local set_rows = ctx.set_rows
 	local set_expanded = ctx.set_expanded
+	local set_hidden_roots = ctx.set_hidden_roots
 	local finish_rebuild = ctx.finish_rebuild
 
 	local started = ya.time()
@@ -83,10 +85,21 @@ function M.run(ctx)
 	local kids_by_parent = {}
 	local dirs_read = 0
 
+	-- While hidden files are off a hidden directory is an unread boundary: it
+	-- is never queued or descended, so its subtree costs no I/O. Each topmost
+	-- skipped hidden directory is recorded in `hidden_deferred` so its
+	-- expansion keys can be retained (see the retention pass below) and the
+	-- poller can exclude the subtree without reading it. Suppression at
+	-- emission (is_visible) still keeps the subtree out of the rows.
 	local queue, qi = {}, 1
+	local hidden_deferred = {}
 	for _, f in ipairs(root_files) do
 		if expandable(f) and expanded_set[tostring(f.url)] then
-			queue[#queue + 1] = f
+			if not show_hidden and f.cha and f.cha.is_hidden then
+				hidden_deferred[tostring(f.url)] = true
+			else
+				queue[#queue + 1] = f
+			end
 		end
 	end
 
@@ -109,7 +122,11 @@ function M.run(ctx)
 			kids_by_parent[dir_str] = kids
 			for _, k in ipairs(kids) do
 				if expandable(k) and expanded_set[tostring(k.url)] then
-					queue[#queue + 1] = k
+					if not show_hidden and k.cha and k.cha.is_hidden then
+						hidden_deferred[tostring(k.url)] = true
+					else
+						queue[#queue + 1] = k
+					end
 				end
 			end
 		else
@@ -127,6 +144,15 @@ function M.run(ctx)
 	-- directory. Unexpanded subtrees stay opaque (lazy expansion).
 	local visible_memo = {}
 	local function is_visible(f)
+		-- Hidden suppression must run before the filter test so a hidden
+		-- directory drops its whole subtree: `walk` only descends into
+		-- children that pass is_visible, so excluding the ancestor excludes
+		-- every descendant and no orphaned injected row can outlive its
+		-- hidden parent. Matching on `f.cha.is_hidden` reproduces Yazi's own
+		-- Entries::split_files rule exactly.
+		if not show_hidden and f.cha and f.cha.is_hidden then
+			return false
+		end
 		if not filter then
 			return true
 		end
@@ -209,14 +235,19 @@ function M.run(ctx)
 
 	set_root_order(gen, tab, order)
 	set_rows(gen, tab, rows)
+	-- Publish the topmost hidden directories skipped by this rebuild so the
+	-- poller can drop their subtree from its scoped keys while hidden is off.
+	set_hidden_roots(gen, tab, hidden_deferred)
 
 	-- Publish the reachable expansion set: keep a key when the BFS read it, or
-	-- when an ancestor's listing failed (its subtree cannot be proven gone).
-	-- Everything else is stale and is dropped, which is what stops a later
-	-- recreation of an old path from auto-expanding.
+	-- when it sits under a directory whose listing failed or that was hidden
+	-- while hidden files are off (both subtrees cannot be proven gone, so
+	-- their keys are retained rather than treated as deleted). Everything else
+	-- is stale and is dropped, which is what stops a later recreation of an
+	-- old path from auto-expanding.
 	local retained = {}
-	local function under_unreadable(u)
-		for d in pairs(unreadable) do
+	local function under_any(u, dirs)
+		for d in pairs(dirs) do
 			if u == d or u:sub(1, #d + 1) == d .. "/" then
 				return true
 			end
@@ -224,7 +255,7 @@ function M.run(ctx)
 		return false
 	end
 	for _, u in ipairs(expanded) do
-		if reached[u] or under_unreadable(u) then
+		if reached[u] or under_any(u, unreadable) or under_any(u, hidden_deferred) then
 			retained[#retained + 1] = u
 		end
 	end
@@ -242,8 +273,8 @@ function M.run(ctx)
 	ya.emit("update_files", {
 		op = fs.op("done", {
 			id = ticket,
-			-- 26.9.1 (014426f) lstat contract: File takes followed `stat` plus
-			-- unfollowed `lstat` instead of the removed `cha` field.
+			-- File constructor contract: followed `stat` plus unfollowed
+			-- `lstat` (the old `cha` field is gone).
 			file = File({
 				url = Url(cwd_str),
 				stat = fs.cha(Url(cwd_str), true),

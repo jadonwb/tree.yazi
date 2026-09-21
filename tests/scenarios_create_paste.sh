@@ -325,3 +325,73 @@ scenario_cut_paste() {
 	assert_log_clean
 	stop_session
 }
+
+# Cut paste with an unrelated committed selection: only the moved URL must be
+# dropped from the selection, so the survivor still routes `r` to stock bulk
+# rename and the bulk list excludes the moved source.
+scenario_cut_paste_keeps_selection() {
+	new_env cut_paste_keeps_selection
+	write_config true adopt
+	make_fixture_cut_paste_selection
+	make_noop_editor
+	launch "$FIXTURE" "EDITOR='$DIR/editor.sh'"
+
+	hovered_is 'dst'
+	send_key j
+	settle 0.4
+	hovered_is 'src'
+	send_key l
+	settle 1.0
+	send_key j
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key x
+	settle 0.4
+	send_key j
+	settle 0.4
+	hovered_is 'b.txt'
+	# Space selects b.txt and advances the cursor to the next row.
+	send_key Space
+	settle 0.4
+
+	# Back up to the destination directory (root-level dst) and cut-paste.
+	send_key k
+	settle 0.3
+	send_key k
+	settle 0.3
+	send_key k
+	settle 0.3
+	hovered_is 'dst'
+	send_key p
+	settle 2.2
+	file_exists "$FIXTURE/dst/a.txt"
+	file_content_is "$FIXTURE/dst/a.txt" 'AAA'
+	file_absent "$FIXTURE/src/a.txt"
+	log_has 'cut paste unyank'
+
+	# The surviving src/b.txt selection must still be present: hover a nested row
+	# and `r` must reach stock bulk rename, not the plugin-owned path. With a
+	# single selected file stock's max_common_root is the file itself, so the
+	# editor list carries basenames.
+	send_key j
+	settle 0.4
+	hovered_is 'src'
+	send_key l
+	settle 0.6
+	send_key j
+	settle 0.4
+	hovered_is 'b.txt'
+	send_key r
+	wait_file_exists "$DIR/selected.txt" 15 "the surviving selection should bulk rename"
+	pane_lacks 'Rename:' "a cut paste must not clear the unrelated selection"
+	log_lacks 'nested rename open' "the surviving selection must delegate to stock rename"
+	grep -qF 'b.txt' "$DIR/selected.txt" ||
+		fail "bulk list should contain the surviving src/b.txt"
+	if grep -qF 'a.txt' "$DIR/selected.txt"; then
+		fail "bulk list should exclude the moved src/a.txt"
+	fi
+
+	snapshot cut_paste_keeps_selection
+	assert_log_clean
+	stop_session
+}

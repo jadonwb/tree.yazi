@@ -1,7 +1,9 @@
--- Asynchronous filesystem passes for the tree plugin's target-aware create and
--- nested rename. Each pass receives only its captured primitive inputs plus the
--- single reconciliation bridge it hands results back to; mutable plugin state
--- stays owned by main.lua. Loaded from inside the existing ya.async callbacks.
+-- Plugin-initiated, keymap-driven filesystem writes: the target-aware create
+-- and nested rename passes. Each pass is loaded lazily from inside its own
+-- existing ya.async callback and receives only its captured primitive inputs
+-- plus the single reconciliation bridge it hands results back to; mutable
+-- plugin state stays owned by main.lua. Compare events.lua, which reconciles
+-- mutations the plugin did not perform.
 
 local M = {}
 
@@ -26,7 +28,7 @@ function M.nested_rename(ctx)
 	local stream = ya.input({
 		title = "Rename:",
 		value = name,
-		-- Stock rename position (hovered, offset [0, 1, 50, 3]).
+		-- Hovered row, plugin-chosen width 50.
 		pos = { "hovered", y = 1, w = 50 },
 		realtime = true,
 	})
@@ -104,7 +106,7 @@ function M.create(ctx)
 		name = "create-file",
 		title = "Create:",
 		history = "shared",
-		-- Stock create popup (top-center, offset [0, 2, 50, 3]).
+		-- Top-center popup, plugin-chosen width 50.
 		pos = { "top-center", y = 2, w = 50 },
 	})
 	if event ~= 1 or value == nil or value == "" then

@@ -57,12 +57,26 @@ new_env() {
 # apply (a user prepend of the same action does not open the search input on
 # this build). write_config_search is the named wrapper; every existing
 # two-argument call keeps the sort bindings.
+#
+# The optional fourth and fifth arguments inject the setup() render options:
+# an explicit `style` string and a raw Lua `glyphs` table literal. The literal
+# is inserted verbatim (the shell cannot validate Lua), so the plugin's own
+# resolve_glyphs decides whether it is accepted or ignored.
 write_config() {
-	local tree="$1" mode="$2" search="${3:-}"
+	local tree="$1" mode="$2" search="${3:-}" style="${4:-}" glyphs="${5:-}"
+	local render=""
+	if [ -n "$style" ]; then
+		render="$render
+	style = \"$style\","
+	fi
+	if [ -n "$glyphs" ]; then
+		render="$render
+	glyphs = $glyphs,"
+	fi
 	cat >"$CFG/init.lua" <<LUA
 require("tree"):setup({
 	filter_mode = "$mode",
-	startup = { tree = $tree, preview = false },
+	startup = { tree = $tree, preview = false },$render
 })
 LUA
 	cat >"$CFG/yazi.toml" <<'TOML'
@@ -148,6 +162,14 @@ write_config_search() {
 	write_config "$1" "$2" search
 }
 
+# Render-option config: an active tree with the default sort bindings plus the
+# given setup() style and/or raw Lua glyphs table literal (empty string to omit
+# either). Keeps write_config_render <style> <glyphs-lua-literal> a two-argument
+# call for the render scenarios.
+write_config_render() {
+	write_config true adopt "" "$1" "${2:-}"
+}
+
 # Extra keymaps for the per-root/tab persistence scenarios. `dest0` and `dest9`
 # are absolute cwd destinations (the fixture root and a second root); `[`/`]`
 # drive stock history back/forward and `t` opens a new tab through the plugin's
@@ -176,6 +198,28 @@ run = "forward"
 [[mgr.prepend_keymap]]
 on = "t"
 run = "plugin tree tab_create"
+TOML
+}
+
+# hidden fixture: a `.hidden/` directory containing child.txt, a visible keep/
+# directory, and plain.txt. With hidden off, `.hidden` must be absent from the
+# tree; when shown and expanded it contributes child.txt beneath it.
+make_fixture_hidden() {
+	rm -rf "$FIXTURE"
+	mkdir -p "$FIXTURE/.hidden" "$FIXTURE/keep"
+	printf 'CHILD' >"$FIXTURE/.hidden/child.txt"
+	printf 'KEEP' >"$FIXTURE/keep/keep.txt"
+	printf 'PLAIN' >"$FIXTURE/plain.txt"
+}
+
+# Append a `hidden` toggle binding to keymap.toml so a scenario can show/hide
+# dotfiles without relying on the stock `<C-h>` preset.
+add_hidden_keymap() {
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "<C-h>"
+run = "hidden toggle"
 TOML
 }
 
@@ -273,6 +317,15 @@ make_fixture_cut() {
 	rm -rf "$FIXTURE"
 	mkdir -p "$FIXTURE/source" "$FIXTURE/target"
 	printf 'MOVEDATA' >"$FIXTURE/source/move.txt"
+}
+
+# cut-paste selection fixture: src/a.txt and src/b.txt plus an empty dst/
+# directory, so a.txt can be cut-pasted while b.txt stays selected.
+make_fixture_cut_paste_selection() {
+	rm -rf "$FIXTURE"
+	mkdir -p "$FIXTURE/src" "$FIXTURE/dst"
+	printf 'AAA' >"$FIXTURE/src/a.txt"
+	printf 'BBB' >"$FIXTURE/src/b.txt"
 }
 
 # removal fixture: alpha/child1.txt, alpha/child2.txt, alpha/sub/subchild.txt,

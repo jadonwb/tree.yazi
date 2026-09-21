@@ -24,10 +24,6 @@ local function rel_of(url_str)
 	return rel and tostring(rel) or nil
 end
 
--- ---------------------------------------------------------------------------
--- Pure URL helpers.
--- ---------------------------------------------------------------------------
-
 -- Absolute-URL, path-boundary-safe subtree membership.
 function M.in_any_subtree(url_str, roots)
 	for _, r in ipairs(roots) do
@@ -53,7 +49,7 @@ function M.remap_abs(url_str, from_str, to_str)
 end
 
 -- Simultaneous absolute-URL resolution for a bulk-rename map: the most specific
--- mapped ancestor wins, so swaps and chains stay order-independent.
+-- mapped ancestor wins.
 function M.remap_abs_bulk(map, url_str)
 	local best_from, best_to, best_len
 	for from_str, to_str in pairs(map) do
@@ -74,9 +70,9 @@ function M.remap_abs_bulk(map, url_str)
 	return best_to .. url_str:sub(#best_from + 1)
 end
 
--- Re-keyed copy of an expansion key set under `resolve`, computed against the
--- untouched original keys so a swap/chain cannot resolve twice. Returns the new
--- set plus whether any key actually moved.
+-- Re-keyed copy of an expansion key set under `resolve` (same untouched-original
+-- resolution as remap_saved_generic). Returns the new set plus whether any key
+-- actually moved.
 function M.remap_key_set(exp, resolve)
 	local out, moved = {}, false
 	for k in pairs(exp) do
@@ -89,7 +85,6 @@ function M.remap_key_set(exp, resolve)
 	return out, moved
 end
 
--- Re-keyed copy of a root-order list under `resolve`.
 function M.remap_list(order, resolve)
 	local out = {}
 	for i, v in ipairs(order) do
@@ -171,9 +166,8 @@ function M.remap_saved_generic(resolve)
 	for _, t in pairs(S.tabs()) do
 		local saved_roots = t.roots
 
-		-- Snapshot every (root, state) pair and resolve it against the untouched
-		-- originals before writing anything back, so a swap (A->B, B->A) or a
-		-- chain (A->B, B->C) cannot clobber its own source mid-iteration.
+		-- Resolve every (root, state) pair against the untouched originals before
+		-- writing anything back.
 		local entries = {}
 		for root, state in pairs(saved_roots) do
 			local new_keys, keys_moved
@@ -345,8 +339,8 @@ function M.prune_rows(target_str)
 	return removed
 end
 
--- Snapshot of the controlled expansion keys. The module rebuilds whole sets, so
--- it reads a plain list and hands the replacement back through commit_mutation.
+-- The module rebuilds whole sets, so it reads a plain list and hands the
+-- replacement back through commit_mutation.
 function M.expanded_keys()
 	local out = {}
 	for url_str in pairs(S.expanded()) do
@@ -355,7 +349,7 @@ function M.expanded_keys()
 	return out
 end
 
--- Snapshot of the depth-0 URL order (nil when the plugin has none yet).
+-- Snapshot of M.root_order (nil when unset).
 function M.root_order_snapshot()
 	local order = S.root_order()
 	if not order then

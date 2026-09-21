@@ -82,10 +82,9 @@ function M.run(ctx)
 
 	-- While hidden files are off a hidden directory is an unread boundary: it
 	-- is never queued or descended, so its subtree costs no I/O. Each topmost
-	-- skipped hidden directory is recorded in `hidden_deferred` so its
-	-- expansion keys can be retained (see the retention pass below) and the
-	-- poller can exclude the subtree without reading it. Suppression at
-	-- emission (is_visible) still keeps the subtree out of the rows.
+	-- skipped hidden directory is recorded in `hidden_deferred` so the poller
+	-- can exclude the subtree without reading it. Suppression at emission
+	-- (is_visible) still keeps the subtree out of the rows.
 	local queue, qi = {}, 1
 	local hidden_deferred = {}
 	for _, f in ipairs(root_files) do
@@ -98,9 +97,14 @@ function M.run(ctx)
 		end
 	end
 
-	-- What the BFS actually reached, plus directories whose listing failed. A
-	-- reachable expanded key is live; a failed read means that subtree is
-	-- unverifiable, so its keys are retained rather than treated as deleted.
+	-- reached: expanded directories this BFS queued and read.
+	-- unreadable: an expanded directory whose fs.read_dir returned nil in this
+	-- pass - gone mid-rebuild, unreadable, or replaced by a non-directory. A
+	-- failed read proves only that the subtree could not be verified, not that
+	-- it was deleted, so the retained loop below keeps these keys.
+	-- Actual deletion/rename is established elsewhere: a removed root never
+	-- appears in root_files, and a lost nested directory is caught by the
+	-- poller's (dev, btime) identity scan, which remaps or prunes it.
 	local reached, unreadable = {}, {}
 	while qi <= #queue do
 		if not check_gen(gen, tab) then
@@ -345,7 +349,7 @@ function M.run(ctx)
 		op = fs.op("done", {
 			id = ticket,
 			-- File constructor contract: followed `stat` plus unfollowed
-			-- `lstat` (the old `cha` field is gone).
+			-- `lstat`.
 			file = File({
 				url = Url(cwd_str),
 				stat = fs.cha(Url(cwd_str), true),

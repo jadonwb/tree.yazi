@@ -28,7 +28,7 @@ function M.nested_rename(ctx)
 	local stream = ya.input({
 		title = "Rename:",
 		value = name,
-		-- Hovered row, plugin-chosen width 50.
+		-- TODO: input geometry is hardcoded; make width/location overridable so a filter-box plugin can support classic and tree view (see notes.txt).
 		pos = { "hovered", y = 1, w = 50 },
 		realtime = true,
 	})
@@ -106,7 +106,7 @@ function M.create(ctx)
 		name = "create-file",
 		title = "Create:",
 		history = "shared",
-		-- Top-center popup, plugin-chosen width 50.
+		-- plugin-chosen width.
 		pos = { "top-center", y = 2, w = 50 },
 	})
 	if event ~= 1 or value == nil or value == "" then

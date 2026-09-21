@@ -7,47 +7,43 @@
 
 local M = {}
 
+-- Sibling modules are raw module tables: either loaded lazily from inside an
+-- existing async context, or resolved and bound once from setup()'s async
+-- init.lua context. Either way they are the plain `package.loaded["tree.<name>"]`
+-- table.
+
 -- Installed by M:setup (async init.lua context); redraw paths are unreachable
 -- without setup, so direct lazy `@sync entry` actions never see it as nil.
 local render
 
--- Raw module table for the async rebuild pass, resolved on the first rebuild
--- from inside the existing async context (same raw-cache pattern as render).
+-- Async rebuild pass, resolved on the first rebuild from inside the async
+-- context.
 local rebuild_pass
 
--- Raw module table for the async create/rename mutation passes, resolved on
--- first use from inside their existing async contexts (same raw-cache pattern).
+-- Async create/rename mutation passes, resolved on first use inside their
+-- existing async contexts.
 local operations
 
--- Raw module table for the setup-installed mutation event handlers, resolved
--- lazily inside the async init.lua context (same raw-cache pattern).
+-- Setup-installed mutation event handlers, resolved lazily in the async init.lua
+-- context.
 local events
 
--- Raw module table for the external-change poll loop, resolved in setup (the
--- sync action paths that call ensure_poller cannot require it themselves;
--- same raw-cache pattern, bound from the async init.lua context).
+-- External-change poll loop, resolved in setup (the sync action paths that call
+-- ensure_poller cannot require it themselves).
 local poller
 
--- Raw module table for the URL/remap/prune and saved-root reconciliation
--- helpers, resolved and bound in setup (called from ya.sync bridges and the
--- events controller; same raw-cache pattern, bound from the async init.lua
--- context).
+-- URL/remap/prune and saved-root reconciliation helpers, bound in setup (called
+-- from ya.sync bridges and the events controller).
 local roots
 
--- Raw module table for the base-ratio capture, effective-ratio composition,
--- active-tab apply, and per-tab sort handoff, resolved and bound in setup (same
--- raw-cache pattern, bound from the async init.lua context).
+-- Base-ratio capture, effective-ratio composition, active-tab apply, and per-tab
+-- sort handoff, bound in setup.
 local layout
 
--- Raw module table for the cursor/cwd-relative/row-rehydration helpers over the
--- active cx folder, resolved in setup (the async init.lua context; same
--- raw-cache pattern). These read cx directly and return values; main.lua keeps
--- the reconcile/seed/strip orchestration and all M bookkeeping.
+-- Cursor/cwd-relative/row-rehydration helpers over the active cx folder, resolved
+-- in setup. These read cx directly and return values; main.lua keeps the
+-- reconcile/seed/strip orchestration and all M bookkeeping.
 local rows
-
--- ---------------------------------------------------------------------------
--- Mode predicates and search-view routing.
--- ---------------------------------------------------------------------------
 
 -- Startup defaults newly observed tabs are seeded from. The canonical base
 -- ratio, the effective-ratio composition, and the sort handoff live in
@@ -91,10 +87,6 @@ end
 -- Original preset Header.flags, captured once so setup() stays idempotent.
 local saved_header_flags
 
--- ---------------------------------------------------------------------------
--- Tree state (module table so it survives across entry calls).
--- ---------------------------------------------------------------------------
-
 M.expanded = {} -- set keyed by directory URL string, at any depth
 M.rows = {} -- per-URL metadata: { depth, last, cont, parent } for injected rows
 M.gen = 0 -- generation, bumped by every sync user action
@@ -137,9 +129,8 @@ local function active_id()
 	return id_num(cx.active.id)
 end
 
--- cwd of an arbitrary (possibly inactive) tab, looked up by numeric id. Used by
--- the cd handler to record a background tab's new root without touching the
--- live state the plugin is rendering for the active tab.
+-- Used by the cd handler to record a background tab's new root without touching
+-- the live state the plugin is rendering for the active tab.
 local function tab_cwd(id)
 	for i = 1, #cx.tabs do
 		local tab = cx.tabs[i]
@@ -430,8 +421,8 @@ local set_filter_query = ya.sync(function(_, query)
 	M.filter_query = query
 end)
 
--- Record the pruned depth-0 order observed by a completed rebuild so a later
--- rename event can remap a root's slot in place.
+-- Record the pruned depth-0 order so a later rename event can remap a root's
+-- slot in place.
 local set_root_order = ya.sync(function(_, gen, tab, order)
 	if M.gen == gen and M.active_tab == tab then
 		M.root_order = order
@@ -453,8 +444,7 @@ end)
 -- the rebuild entered, used by the native Full-load repair to re-emit the rows
 -- synchronously without a filesystem read. `has_descendants` records whether
 -- that emitted set contained any depth>0 row, so `on_load` only replays a
--- genuinely dropped tree. Same generation/tab gate as set_rows, so a superseded
--- rebuild cannot publish a stale stash.
+-- genuinely dropped tree. Same generation/tab gate as check_gen.
 local set_injected_files = ya.sync(function(_, gen, tab, cwd, snapshot, hovered_url, has_descendants)
 	if M.gen == gen and M.active_tab == tab then
 		M.inject_snapshot = snapshot
@@ -470,8 +460,7 @@ end)
 -- stale, so it is dropped here: the old URL becomes a tombstone and a directory
 -- later recreated there cannot silently auto-expand. Keys under a directory
 -- whose read failed are retained by the caller because that subtree is
--- unverifiable, not proven gone. Same generation/tab gate as every other
--- rebuild bridge, so a superseded rebuild cannot clobber newer user state.
+-- unverifiable, not proven gone. Same gate as check_gen.
 local set_expanded = ya.sync(function(_, gen, tab, retained)
 	if M.gen == gen and M.active_tab == tab then
 		local new = {}
@@ -492,8 +481,7 @@ end)
 -- Publish the topmost hidden directories skipped by the last completed rebuild
 -- while hidden files were off, keyed by absolute URL string. The poll scope
 -- uses this set to drop the hidden subtree from the polled keys, so a hidden
--- subtree is never stat'd until hidden is shown again. Same generation/tab gate
--- as set_expanded, so a superseded rebuild cannot publish a stale hidden scope.
+-- subtree is never stat'd until hidden is shown again. Same gate as check_gen.
 local set_hidden_roots = ya.sync(function(_, gen, tab, hidden)
 	if M.gen == gen and M.active_tab == tab then
 		local new = {}
@@ -504,10 +492,10 @@ local set_hidden_roots = ya.sync(function(_, gen, tab, hidden)
 	end
 end)
 
--- Completion marker: only the generation and tab that still own the folder may
--- clear the pending flag and record whether descendants are now injected. A
--- failed read passes nil and only clears the in-flight flag, or every later
--- toggle-off thinks a rebuild is still pending forever.
+-- Completion marker: clears the pending flag and records whether descendants
+-- are now injected. A failed read passes nil and only clears the in-flight
+-- flag, or every later toggle-off thinks a rebuild is still pending forever.
+-- Same gate as check_gen.
 local finish_rebuild = ya.sync(function(_, gen, tab, injected)
 	if M.gen == gen and M.active_tab == tab then
 		M.injecting = false
@@ -607,7 +595,6 @@ local function rebuild(gen, focus_str, pin)
 	ya.async(function()
 		if not rebuild_pass then
 			require("tree.rebuild") -- async context: safe here
-			-- Raw module table: plain sync entry, no require-proxy wrapper.
 			rebuild_pass = package.loaded["tree.rebuild"]
 		end
 		rebuild_pass.run({
@@ -661,10 +648,6 @@ local function install_header_filter()
 		})
 	end
 end
-
--- ---------------------------------------------------------------------------
--- Key routing
--- ---------------------------------------------------------------------------
 
 local function hovered()
 	return cx.active.current.hovered
@@ -996,13 +979,11 @@ local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, visible, hove
 		)
 	end
 	M.gen = M.gen + 1
-	-- Stock's removal keeps the cursor's slot: a surviving hovered row stays,
-	-- else the next surviving row shifts up into the deleted slot, and only an
-	-- end-of-list delete clamps back to the previous row. The rebuild reset the
-	-- native cursor, so recreate that order over the pre-change visible sequence
-	-- and let M:focus resolve it against the rebuilt files, skipping any row
-	-- that vanished or is hidden by the active tree filter. An external move
-	-- remaps each candidate through the same map as the expansion keys.
+	-- Removal focus anchor as in events.lua's on_remove: recreate stock's
+	-- keep-the-slot cursor over the pre-change visible sequence and let M:focus
+	-- resolve it against the rebuilt files, skipping any row that vanished or is
+	-- hidden by the active tree filter. An external move remaps each candidate
+	-- through the same map as the expansion keys.
 	local candidates, seen = {}, {}
 	local function add_candidate(u)
 		if u and not seen[u] then
@@ -1134,7 +1115,6 @@ function M:rename()
 	ya.async(function()
 		if not operations then
 			require("tree.operations") -- async context: safe here
-			-- Raw module table: plain call, no require-proxy wrapper.
 			operations = package.loaded["tree.operations"]
 		end
 		operations.nested_rename({
@@ -1351,7 +1331,6 @@ function M:create(args)
 	ya.async(function()
 		if not operations then
 			require("tree.operations") -- async context: safe here
-			-- Raw module table: plain call, no require-proxy wrapper.
 			operations = package.loaded["tree.operations"]
 		end
 		operations.create({
@@ -1403,16 +1382,7 @@ function M:paste(args)
 	end
 
 	local dest_str = tostring(dest)
-	ya.dbg(
-		"[tree-dbg] paste force=",
-		tostring(force),
-		"cut=",
-		tostring(cut),
-		"dest=",
-		dest_str,
-		"items=",
-		#items
-	)
+	ya.dbg("[tree-dbg] paste force=", tostring(force), "cut=", tostring(cut), "dest=", dest_str, "items=", #items)
 	if #items == 0 then
 		return
 	end
@@ -1777,14 +1747,7 @@ local function on_cd(payload)
 		M.inject_has_descendants = nil
 		M.expanded, M.rows = {}, {}
 		M.root_order, M.filter_query = nil, nil
-		ya.dbg(
-			"[tree-dbg] cd search view; tab=",
-			tab,
-			" root=",
-			root,
-			" tree=",
-			tostring(t.tree)
-		)
+		ya.dbg("[tree-dbg] cd search view; tab=", tab, " root=", root, " tree=", tostring(t.tree))
 		stop_poller()
 		return
 	end
@@ -1858,10 +1821,6 @@ local function on_tab(payload)
 	activate(tab)
 end
 
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
-
 function M:setup(opts)
 	opts = opts or {}
 
@@ -1870,8 +1829,7 @@ function M:setup(opts)
 	-- accessor must exist before any layout.* call below.
 	if not layout then
 		require(".layout") -- runs in init.lua's async context
-		-- Raw module table: bind() installs the live-tab accessor; no per-call
-		-- require.
+		-- bind() installs the live-tab accessor.
 		layout = package.loaded["tree.layout"]
 	end
 	layout.bind({
@@ -1886,21 +1844,20 @@ function M:setup(opts)
 
 	if not render then
 		require(".render") -- runs in init.lua's async context
-		-- Raw module table: plain sync functions, no per-row require proxy.
+		-- plain sync functions.
 		render = package.loaded["tree.render"]
 	end
 	render.configure(opts)
 
 	if not poller then
 		require(".poller") -- runs in init.lua's async context
-		-- Raw module table: start() binds the sync bridges; no per-tick require.
+		-- start() binds the sync bridges.
 		poller = package.loaded["tree.poller"]
 	end
 
 	if not roots then
 		require(".roots") -- runs in init.lua's async context
-		-- Raw module table: bind() installs the live-state accessor; no
-		-- per-call require.
+		-- bind() installs the live-state accessor.
 		roots = package.loaded["tree.roots"]
 	end
 	roots.bind({
@@ -1938,8 +1895,7 @@ function M:setup(opts)
 
 	if not rows then
 		require(".rows") -- runs in init.lua's async context
-		-- Raw module table: plain sync helpers that read cx directly; no
-		-- per-call require and no accessor.
+		-- plain sync helpers that read cx directly.
 		rows = package.loaded["tree.rows"]
 	end
 
@@ -2093,12 +2049,7 @@ function M:toggle()
 		-- reconciliation are deferred until the next physical cd applies them,
 		-- so the provider Folder is never mutated.
 		t.tree = not t.tree
-		ya.dbg(
-			"[tree-dbg] toggle in search view; tab=",
-			M.active_tab,
-			" recorded tree=",
-			tostring(t.tree)
-		)
+		ya.dbg("[tree-dbg] toggle in search view; tab=", M.active_tab, " recorded tree=", tostring(t.tree))
 		stop_poller()
 		layout.apply_active()
 		return
@@ -2203,14 +2154,7 @@ function M:entry(job)
 	else
 		log_tree, log_preview = startup_defaults.tree, startup_defaults.preview
 	end
-	ya.dbg(
-		"[tree-dbg] entry action=",
-		tostring(action),
-		"tree=",
-		tostring(log_tree),
-		"preview=",
-		tostring(log_preview)
-	)
+	ya.dbg("[tree-dbg] entry action=", tostring(action), "tree=", tostring(log_tree), "preview=", tostring(log_preview))
 
 	if action == "toggle" then
 		M:toggle()

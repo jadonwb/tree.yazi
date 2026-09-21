@@ -124,10 +124,8 @@ local function on_bulk_rename(ctl, payload)
 		map[tostring(from)] = tostring(to)
 	end
 
-	-- Saved per-root state of every tab is re-keyed against the same untouched
-	-- map, including roots other than the active one, regardless of which tab is
-	-- active or whether it is in tree mode. A bulk rename performed from a
-	-- classic tab must not leave a tree tab's stale expansion keys behind.
+	-- Same saved-state policy as on_rename, keyed by the untouched map and
+	-- covering roots other than the active one.
 	local saved_touched = ctl.remap_saved_bulk(map)
 
 	-- Live-state remap and the follow-up rebuild only apply to the active tree
@@ -280,12 +278,8 @@ local function on_remove(ctl, kind)
 				end
 			end
 		end
-		-- Saved per-root state of every tab is maintained regardless of which
-		-- tab is active or whether it is in tree mode: a removal performed from
-		-- a classic tab must still prune the stale expansion keys of a tree tab,
-		-- or a directory later recreated at the same URL would resurrect them.
-		-- Absolute-URL subtree tests, so roots other than the active one are
-		-- covered too.
+		-- Same saved-state policy as on_rename (pruned here), using absolute-URL
+		-- subtree tests so roots other than the active one are covered too.
 		local saved_touched = ctl.prune_saved(all_removed)
 		if not affected then
 			if saved_touched then
@@ -363,9 +357,9 @@ end
 -- Successful copy/move completion for an expanded (or cwd) branch: rebuild so
 -- new children appear under their parent and moved-away rows disappear.
 --
--- A move also removes the source path from the filesystem, so every tab's saved
--- roots are pruned for the moved-away `from` URLs regardless of the active tab's
--- mode; a duplicate only adds a destination and never invalidates saved state.
+-- A move prunes every tab's saved roots for the moved-away sources (same
+-- saved-state policy as on_rename); a copy only adds a destination and never
+-- invalidates saved state.
 local function on_transfer(ctl, kind)
 	return function(payload)
 		local items = payload and payload.items

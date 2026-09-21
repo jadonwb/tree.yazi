@@ -45,7 +45,7 @@ local function has_descendants()
 	return false
 end
 
--- Depth-0 url order as currently displayed; used only to seed M.root_order.
+-- Used only to seed M.root_order.
 local function capture_root_order()
 	local order = {}
 	for _, f in ipairs(cx.active.current.files) do
@@ -54,7 +54,6 @@ local function capture_root_order()
 	return order
 end
 
--- Bounded diagnostic helper: how many keys a state table currently holds.
 local function count_keys(t)
 	local n = 0
 	for _ in pairs(t or {}) do

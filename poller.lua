@@ -88,15 +88,15 @@ local function poll_scan(scope, lost)
 		if kids then
 			for _, k in ipairs(kids) do
 				local u = tostring(k.url)
-				local cha = k.cha
+				local stat = k.stat
 				if
 					not known[u]
-					and cha
-					and cha.is_dir
-					and not cha.is_link
-					and not cha.is_indirect
+					and stat
+					and stat.is_dir
+					and not stat.is_link
+					and not stat.is_indirect
 				then
-					local id = dir_identity(cha.dev, cha.btime)
+					local id = dir_identity(stat.dev, stat.btime)
 					if id and wanted[id] then
 						local list = matches[id]
 						if not list then
@@ -148,7 +148,7 @@ local function poll_tick(token, ctx)
 	end
 	local sig, dirty, lost = {}, false, {}
 	for _, url_str in ipairs(scope.urls) do
-		local stat = fs.cha(Url(url_str), false)
+		local stat = fs.stat(Url(url_str), false)
 		local prev = scope.sig[url_str]
 		if stat and stat.is_dir then
 			if
@@ -176,7 +176,7 @@ local function poll_tick(token, ctx)
 		dirty = true
 	end
 	if scope.hover_file and scope.hover_file.mtime ~= nil then
-		local stat = fs.cha(Url(scope.hover_file.url), true)
+		local stat = fs.stat(Url(scope.hover_file.url), true)
 		if not stat or stat.is_dir then
 			dirty = true
 		elseif stat.mtime ~= scope.hover_file.mtime or stat.len ~= scope.hover_file.len then

@@ -578,7 +578,7 @@ end
 
 local REPLACEMENT = "\239\191\189" -- U+FFFD
 
--- Transliterate `s`, returning it unchanged when every byte is ASCII.
+-- Fast path: return immediately when every byte is ASCII.
 function M.apply(s)
 	if not s or s == "" then
 		return s

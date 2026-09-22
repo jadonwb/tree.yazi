@@ -343,7 +343,6 @@ function M.expanded_keys()
 	return out
 end
 
--- Snapshot of M.root_order (nil when unset).
 function M.root_order_snapshot()
 	local order = S.root_order()
 	if not order then

@@ -70,7 +70,7 @@ function M.run(ctx)
 	-- costs no I/O. Symlinked/indirect directories are never descended
 	-- (cycle guard); a read failure simply drops that subtree.
 	local function expandable(f)
-		return f.cha and f.cha.is_dir and not f.cha.is_link and not f.cha.is_indirect
+		return f.stat and f.stat.is_dir and not f.stat.is_link and not f.stat.is_indirect
 	end
 
 	local kids_by_parent = {}
@@ -85,7 +85,7 @@ function M.run(ctx)
 	local hidden_deferred = {}
 	for _, f in ipairs(root_files) do
 		if expandable(f) and expanded_set[tostring(f.url)] then
-			if not show_hidden and f.cha and f.cha.is_hidden then
+			if not show_hidden and f.stat and f.stat.is_hidden then
 				hidden_deferred[tostring(f.url)] = true
 			else
 				queue[#queue + 1] = f
@@ -117,7 +117,7 @@ function M.run(ctx)
 			kids_by_parent[dir_str] = kids
 			for _, k in ipairs(kids) do
 				if expandable(k) and expanded_set[tostring(k.url)] then
-					if not show_hidden and k.cha and k.cha.is_hidden then
+					if not show_hidden and k.stat and k.stat.is_hidden then
 						hidden_deferred[tostring(k.url)] = true
 					else
 						queue[#queue + 1] = k
@@ -143,9 +143,9 @@ function M.run(ctx)
 		-- directory drops its whole subtree: `walk` only descends into
 		-- children that pass is_visible, so excluding the ancestor excludes
 		-- every descendant and no orphaned injected row can outlive its
-		-- hidden parent. Matching on `f.cha.is_hidden` reproduces Yazi's own
+		-- hidden parent. Matching on `f.stat.is_hidden` reproduces Yazi's own
 		-- Entries::split_files rule exactly.
-		if not show_hidden and f.cha and f.cha.is_hidden then
+		if not show_hidden and f.stat and f.stat.is_hidden then
 			return false
 		end
 		if not filter then
@@ -345,11 +345,11 @@ function M.run(ctx)
 		op = fs.op("done", {
 			id = ticket,
 			-- File constructor contract: followed `stat` plus unfollowed
-			-- `lstat`.
+			-- `lstat`, because FileExtra rejects a `FOLLOW` lstat.
 			file = File({
 				url = Url(cwd_str),
-				stat = fs.cha(Url(cwd_str), true),
-				lstat = fs.cha(Url(cwd_str), false),
+				stat = fs.stat(Url(cwd_str), true),
+				lstat = fs.stat(Url(cwd_str), false),
 			}),
 		}),
 	})

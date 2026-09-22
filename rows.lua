@@ -42,7 +42,7 @@ local function has_descendants()
 	return false
 end
 
--- Used only to seed M.root_order.
+-- Only used to seed M.root_order.
 local function capture_root_order()
 	local order = {}
 	for _, f in ipairs(cx.active.current.files) do
@@ -115,8 +115,8 @@ local function seed_root_order()
 		return nil
 	end
 	table.sort(files, function(a, b)
-		local ad = a.cha and a.cha.is_dir and true or false
-		local bd = b.cha and b.cha.is_dir and true or false
+		local ad = a.stat and a.stat.is_dir and true or false
+		local bd = b.stat and b.stat.is_dir and true or false
 		if ad ~= bd then
 			return ad
 		end

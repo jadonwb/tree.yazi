@@ -37,10 +37,10 @@ KEEP="${TREE_IT_KEEP:-0}"
 COLS=110
 ROWS=32
 
-# Build this harness targets. Both the earlier b8973fb-era build and 014426f
+# Build this harness targets. Both the earlier b8973fb-era build and 0ea4c5d
 # report 26.9.1, so the revision is what distinguishes the lstat/File contract.
 EXPECTED_VERSION="26.9.1"
-EXPECTED_REVISION="014426f"
+EXPECTED_REVISION="0ea4c5d"
 
 SCENARIOS=(
 	startup
@@ -65,6 +65,8 @@ SCENARIOS=(
 	create
 	create_overwrite
 	create_collisions
+	bulk_create
+	bulk_create_collision
 	paste
 	cut_paste
 	cut_paste_keeps_selection

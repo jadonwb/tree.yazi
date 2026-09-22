@@ -12,16 +12,13 @@ local M = {}
 -- without setup, so direct lazy `@sync entry` actions never see it as nil.
 local render
 
--- Async rebuild pass, resolved on the first rebuild from inside the async
--- context.
+-- Async rebuild pass; resolved lazily on first rebuild (async context).
 local rebuild_pass
 
--- Async create/rename mutation passes, resolved on first use inside their
--- existing async contexts.
+-- Async create/rename passes; resolved lazily on first use.
 local operations
 
--- Setup-installed mutation event handlers, resolved lazily in the async init.lua
--- context.
+-- Setup-installed mutation event handlers; resolved lazily.
 local events
 
 -- External-change poll loop, resolved in setup (the sync action paths that call
@@ -32,19 +29,13 @@ local poller
 -- from ya.sync bridges and the events controller).
 local roots
 
--- Base-ratio capture, effective-ratio composition, active-tab apply, and per-tab
--- sort handoff, bound in setup.
 local layout
 
--- Cursor/cwd-relative/row-rehydration helpers over the active cx folder, resolved
--- in setup. These read cx directly and return values; main.lua keeps the
--- reconcile/seed/strip orchestration and all M bookkeeping.
+-- main.lua keeps the reconcile/seed/strip orchestration and all M bookkeeping.
 local rows
 
--- Startup defaults newly observed tabs are seeded from. The canonical base
--- ratio, the effective-ratio composition, and the sort handoff live in
--- layout.lua behind the bound accessor. Mode state itself lives per tab in
--- M.tabs; there is no bare global flag.
+-- Startup defaults for newly observed tabs; mode state lives per tab in M.tabs
+-- (no bare global flag).
 local startup_defaults = { tree = false, preview = true }
 
 local function tab_state(id)
@@ -85,14 +76,14 @@ local saved_header_flags
 
 M.expanded = {} -- set keyed by directory URL string, at any depth
 M.rows = {} -- per-URL metadata: { depth, last, cont, parent } for injected rows
-M.gen = 0 -- generation, bumped by every sync user action
+M.gen = 0 -- bumped by every sync user action
 M.pending_focus = nil -- URL string (or ordered candidate list) to reposition onto
 M.injected = false -- whether the last completed rebuild injected descendants
 M.injecting = false -- a rebuild is scheduled or in flight (not yet completed)
 M.inject_snapshot = nil -- plain-table replay stash of the last injected rows
-M.inject_cwd = nil -- root URL the replay stash was built for
-M.inject_tab = nil -- tab id the replay stash was published for
-M.inject_has_descendants = nil -- whether the replay stash contained depth>0 rows
+M.inject_cwd = nil -- root URL for inject_snapshot
+M.inject_tab = nil
+M.inject_has_descendants = nil
 M.last_hovered = nil -- URL last seen hovered by the poll scope
 M.root_order = nil -- authoritative depth-0 URL order (kept across rebuilds/rename)
 M.filter_query = nil -- active hierarchy-aware tree filter query; nil shows every row
@@ -148,8 +139,6 @@ local filter_mode = "adopt"
 -- invalidate an injection.
 M.seq = 1000000000
 
--- The per-tab sort handoff lives on M.tabs[id].sort_saved; its capture, copy,
--- pin, and restore helpers live in layout.lua behind the bound accessor.
 local cd_subscribed = false
 local tab_subscribed = false
 local mutate_subscribed = false
@@ -204,22 +193,18 @@ local function on_key_hidden(form)
 	return form
 end
 
--- Post-load repair for a native Full reload. Yazi replaces the cwd Folder's
--- entries wholesale on a Full load (window focus after an external save marks
--- the folder stale, `refresh`/Ctrl+R, a re-entered root), and because tree mode
--- pins the tab's sort to `none` the reload lists raw read_dir order with the
--- injected descendants gone. The DDS `load` event fires after that swap (and
--- after the plugin's own Part/Done), so re-emit the recorded hierarchy once a
--- load lands on the current root with no descendants left. The previous rebuild
--- publishes a plain-table stash (set_injected_files) precisely so this repair is
--- synchronous and the flat `sort=none` listing is never painted; fresh File
--- userdata are rebuilt from the stash (File(table) does not consume it) under a
--- new ticket, the prior hover is re-arrowed, and the async reassert is still
--- queued to refresh metadata. When no usable stash exists, fall back to the
--- queued reassert. Guards: only while tree mode is on, nothing is injecting, and
--- at least one expansion is recorded; the replay additionally requires a stash
--- that recorded descendants, so a hidden/filtered/empty expansion cannot loop
--- on the load the replay itself publishes.
+-- Post-load repair for a native Full reload. A Full load (window focus after an
+-- external save marks the folder stale, `refresh`/Ctrl+R, a re-entered root)
+-- replaces the cwd Folder's entries wholesale and, with the tab's sort pinned
+-- to `none`, lists raw read_dir order with the injected descendants gone. The
+-- DDS `load` event fires after that swap, so re-emit the recorded hierarchy
+-- synchronously from the plain-table stash (set_injected_files) so the flat
+-- listing is never painted: fresh File userdata are rebuilt under a new ticket,
+-- the prior hover is re-arrowed, and an async reassert refreshes metadata. When
+-- no usable stash exists, fall back to the queued reassert. Guards: tree mode
+-- on, nothing injecting, an expansion recorded, and a stash that recorded
+-- descendants (a hidden/filtered/empty expansion must not loop on the `load`
+-- the replay itself publishes).
 local function on_load(body)
 	if not active_tree() or M.injecting then
 		return
@@ -290,8 +275,7 @@ local function on_load(body)
 	})
 	M.injecting = false
 
-	-- Re-arrow to the row hovered before the reload, then rebuild asynchronously
-	-- to refresh metadata and re-anchor the cursor.
+	-- Re-arrow to the pre-reload hover, then rebuild asynchronously.
 	M.pending_focus = hover
 	ya.emit("plugin", { "tree", "focus" })
 	ya.emit("plugin", { "tree", "reassert" })
@@ -324,18 +308,18 @@ end
 
 -- Regular file test mirroring stock `hovered.is_file()`: directories, links,
 -- and special files all keep the default end-of-value rename caret.
-local function is_regular(cha)
-	if not cha then
+local function is_regular(stat)
+	if not stat then
 		return false
 	end
 	return not (
-		cha.is_dir
-		or cha.is_link
-		or cha.is_indirect
-		or cha.is_fifo
-		or cha.is_sock
-		or cha.is_block
-		or cha.is_char
+		stat.is_dir
+		or stat.is_link
+		or stat.is_indirect
+		or stat.is_fifo
+		or stat.is_sock
+		or stat.is_block
+		or stat.is_char
 	)
 end
 
@@ -415,13 +399,9 @@ local set_rows = ya.sync(function(_, gen, tab, rows)
 	end
 end)
 
--- Publish the plain-table replay stash a completed rebuild captured before its
--- File userdata were consumed by the injection. `snapshot` is a list of
--- { url, stat, lstat, link_to } tables and `hovered_url` the row hovered when
--- the rebuild entered, used by the native Full-load repair to re-emit the rows
--- synchronously without a filesystem read. `has_descendants` records whether
--- that emitted set contained any depth>0 row, so `on_load` only replays a
--- genuinely dropped tree. Same generation/tab gate as check_gen.
+-- Publish the plain-table replay stash (see on_load) with the pre-reload hover
+-- and whether the emitted set carried any depth>0 row. Same generation/tab gate
+-- as check_gen.
 local set_injected_files = ya.sync(function(_, gen, tab, cwd, snapshot, hovered_url, has_descendants)
 	if M.gen == gen and M.active_tab == tab then
 		M.inject_snapshot = snapshot
@@ -527,8 +507,8 @@ local function rebuild(gen, focus_str, pin)
 	-- the Hidden actor, so the value read here is the post-toggle state.
 	local show_hidden = cx.active.pref.show_hidden
 
-	-- Keep the per-tab root tracking current even when the plugin acts without
-	-- a preceding cd (for example the first expansion after toggle-on).
+	-- Keep the per-tab root tracking current when the plugin acts without a
+	-- preceding cd.
 	local t = tab_state(tab)
 	if t then
 		t.root = cwd_str
@@ -598,12 +578,8 @@ local function rebuild(gen, focus_str, pin)
 	end)
 end
 
--- Header indication: the wrapped Header:flags delegates to the untouched stock
--- renderer whenever tree mode is off or no tree query is live, and otherwise
--- feeds it the plugin-owned query.
-
 local function install_header_filter()
-	if saved_header_flags or not (Header and Header.flags) then
+	if saved_header_flags then
 		return
 	end
 	saved_header_flags = Header.flags
@@ -665,16 +641,10 @@ local function reconcile_root()
 	ui.render()
 end
 
--- A freshly activated tree tab starts with an empty expansion set and no
--- captured root order. Yazi's folder load normally applies the configured sort,
--- but when that configured sort is `none` (or was otherwise suppressed) the
--- listing is left in raw read_dir order, and a pinned `none` sorter will not
--- reorder it. Seed an explicit directories-first alphabetical root order from
--- the folder's real depth-0 children and rebuild once, so the fresh listing is
--- deterministic. Only when there is no captured order and nothing expanded;
--- native provider Views and an unloaded (or empty) folder are skipped. Returns
--- true when the folder rows were available to seed from; rows.lua only computes
--- the order, the M writes and the rebuild stay here.
+-- Seed a directories-first alphabetical root order for a freshly activated tree
+-- tab with no captured order and nothing expanded, then rebuild once so the
+-- listing is deterministic rather than raw read_dir order. Returns true when the
+-- folder rows were available to seed from.
 local function seed_root_order()
 	if native_search_view() then
 		return true
@@ -721,10 +691,6 @@ local function schedule_seed(tab, root)
 	end)
 end
 
--- URL remap/prune and saved-root reconciliation live in roots.lua behind the
--- bound accessor (see M:setup). Only the sync-side nested-rename application
--- stays here, because it bumps the generation and coalesces a rebuild.
-
 -- Sync-side application of a plugin-owned nested rename. The async input task
 -- cannot touch M or cx, so it hands both the old and the resolved new URL back
 -- here to re-key the expansion subtree (a renamed directory must keep its
@@ -749,21 +715,14 @@ local apply_nested_rename = ya.sync(function(_, old_str, new_str)
 	rebuild(M.gen, new_str)
 end)
 
--- Deletion/transfer reconciliation lives in events.lua; the per-root prune
--- helpers it calls are in roots.lua.
-
 -- True when `url_str` is the active tree root or an expanded directory: the two
 -- places where a created/removed/transferred child becomes a visible row.
 local function is_tree_parent(url_str)
 	return url_str == tostring(cx.active.current.cwd) or M.expanded[url_str]
 end
 
--- Expansion-key/root-order snapshots and per-root removal pruning live in
--- roots.lua behind the bound accessor.
-
--- Single commit for every mutation handler: install the replacement sets when
--- the module computed them, bump the generation, request the focus, then redraw
--- and coalesce one controlled rebuild. Preserves the existing update order.
+-- Single commit for every mutation handler: install the replacement sets, bump
+-- the generation, request the focus, redraw, and coalesce one controlled rebuild.
 local function commit_mutation(focus, new_expanded, new_root_order)
 	if new_expanded then
 		M.expanded = new_expanded
@@ -830,8 +789,8 @@ local poll_scope = ya.sync(function(_, token)
 	-- listing changes in expanded dirs. The baseline is the displayed File's own
 	-- followed stat, so a hover change self-resets and no field persists.
 	local hover_file
-	if h and h.cha and not h.cha.is_dir and rows.relative_of(h):find("/", 1, true) then
-		hover_file = { url = tostring(h.url), mtime = h.cha.mtime, len = h.cha.len }
+	if h and h.stat and not h.stat.is_dir and rows.relative_of(h):find("/", 1, true) then
+		hover_file = { url = tostring(h.url), mtime = h.stat.mtime, len = h.stat.len }
 	end
 	-- Pre-change visible flattened sequence and the hovered row's slot in it.
 	-- The rebuild's empty FilesOp part resets the native cursor, so the tick
@@ -865,21 +824,15 @@ local poll_scope = ya.sync(function(_, token)
 	}
 end)
 
--- Install the tick's compact snapshot and, when the tick observed a real
--- change, coalesce exactly one rebuild through the existing guards. A newer
--- generation means an action or mutation event already owns the folder: the
--- tick yields without installing its snapshot so the next tick re-detects the
--- change once the folder is quiet. The snapshot otherwise replaces M.dir_sig
--- wholesale, so signatures for directories that are no longer expanded (or
--- belonged to a previous root) are pruned. Runs in the sync context.
---
--- `moves` (old URL -> new URL) and `prunes` (old URLs) describe an external
--- rename the async scan resolved by directory identity. They are applied to the
--- live and saved expansion state through the same remap/prune machinery the
--- rename/remove events use, before the one rebuild that follows.
---
--- Returns (rebuilt, empty_expansion): `empty_expansion` tells the poll loop to
--- stop when this tick pruned the last live expansion key, mirroring M:left.
+-- Install the tick's compact snapshot and, when a real change was observed,
+-- coalesce exactly one rebuild through the existing guards. A newer generation
+-- means an action or mutation event already owns the folder, so the tick yields
+-- without installing its snapshot; otherwise the snapshot replaces M.dir_sig
+-- wholesale, pruning signatures for directories no longer expanded. `moves`
+-- (old URL -> new URL) and `prunes` (old URLs) are an external rename resolved
+-- by directory identity, applied through the same remap/prune machinery as the
+-- rename/remove events. Returns (rebuilt, empty_expansion): the poll loop stops
+-- when this tick pruned the last live expansion key.
 local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, visible, hover_idx, dirty, moves, prunes)
 	if token ~= poll_token or not active_tree() then
 		return false
@@ -1017,14 +970,11 @@ end
 
 -- r: tree-aware rename. Outside tree mode, for a depth-0 row, with a native
 -- multi-selection, or during an active visual range this delegates to stock
--- rename (which routes selections to bulk rename, already remapped by the
--- events module). A visual range is not written to `cx.active.selected` until
--- stock's own Rename actor commits it (`escape_visual`), so it must be detected
--- through `cx.active.mode` and delegated before the nested-row decision.
--- Delegation forwards the stock preset binding's `cursor = "before_ext"` so
--- caret placement there is unchanged. A single injected descendant at any depth
--- is renamed beside its parent by the plugin, without stock `reveal` rerooting
--- the tab onto the child path; its caret reproduces `before_ext` by opening a
+-- rename, forwarding the stock binding's `cursor = "before_ext"`. An in-progress
+-- visual range is not yet in `cx.active.selected` (stock's Rename actor runs
+-- `escape_visual` itself), so it is detected through `cx.active.mode`. A single
+-- injected descendant at any depth is renamed beside its parent without stock
+-- `reveal` rerooting the tab; its caret reproduces `before_ext` by opening a
 -- realtime input and emitting the input layer's own `move` offset. Casefold
 -- handling remains the only stock capability the plugin-owned path cannot run.
 function M:rename()
@@ -1039,11 +989,9 @@ function M:rename()
 		return
 	end
 
-	-- Stock rename hands any non-empty selection to bulk rename. An in-progress
-	-- visual range has not been committed to `selected` yet (stock's Rename actor
-	-- runs escape_visual itself), so any non-normal manager mode must delegate
-	-- immediately or a nested row would fall through to the plugin-owned path.
-	if #cx.active.selected > 0 or (cx.active.mode and not cx.active.mode.is_normal) then
+	-- Any native multi-selection, and any uncommitted visual range (non-normal
+	-- manager mode), must delegate to stock.
+	if #cx.active.selected > 0 or not cx.active.mode.is_normal then
 		ya.emit("rename", { cursor = "before_ext" })
 		return
 	end
@@ -1058,7 +1006,7 @@ function M:rename()
 
 	local old_url_str = tostring(h.url)
 	local name = h.name and tostring(h.name) or ""
-	local move = before_ext_move(name, is_regular(h.cha))
+	local move = before_ext_move(name, is_regular(h.stat))
 	ya.dbg("[tree-dbg] nested rename open; old=", old_url_str, "move=", tostring(move))
 
 	ya.async(function()
@@ -1087,10 +1035,10 @@ function M:right()
 	if not h then
 		return
 	end
-	if not h.cha.is_dir then
+	if not h.stat.is_dir then
 		return
 	end
-	if h.cha.is_link or h.cha.is_indirect then
+	if h.stat.is_link or h.stat.is_indirect then
 		ya.dbg("[tree-dbg] refusing to expand linked directory; url=", tostring(h.url))
 		return
 	end
@@ -1124,7 +1072,7 @@ function M:left()
 
 	local target
 	local url_str = tostring(h.url)
-	if h.cha and h.cha.is_dir and M.expanded[url_str] then
+	if h.stat and h.stat.is_dir and M.expanded[url_str] then
 		target = url_str
 	else
 		local meta = M.rows[url_str]
@@ -1187,7 +1135,7 @@ function M:root_down()
 	if not h then
 		return
 	end
-	if h.cha and h.cha.is_dir then
+	if h.stat and h.stat.is_dir then
 		ya.dbg("[tree-dbg] root_down dir -> ", tostring(h.url))
 		ya.emit("cd", { h.url })
 		return
@@ -1255,7 +1203,7 @@ function M:create(args)
 		return
 	end
 
-	local target = h.cha and h.cha.is_dir and h.url or h.url.parent
+	local target = h.stat and h.stat.is_dir and h.url or h.url.parent
 	if not target then
 		ya.emit("create", { force = force })
 		return
@@ -1283,6 +1231,51 @@ function M:create(args)
 	end)
 end
 
+-- A: bulk create at the hovered tree level. Outside tree mode, with no hover,
+-- or when the resolved destination is the tree root, delegate to stock
+-- bulk_create (which joins every typed path to the cwd, exactly what is wanted
+-- there). Otherwise the destination is the hovered directory, or the hovered
+-- file's own directory, and every path typed in the user's text editor is
+-- created under it without changing cwd.
+function M:bulk_create(args)
+	if not active_tree() then
+		ya.emit("bulk_create", {})
+		return
+	end
+
+	local h = hovered()
+	if not h then
+		ya.emit("bulk_create", {})
+		return
+	end
+
+	local target = h.stat and h.stat.is_dir and h.url or h.url.parent
+	if not target then
+		ya.emit("bulk_create", {})
+		return
+	end
+
+	local cwd_str = tostring(cx.active.current.cwd)
+	local target_str = tostring(target)
+	if target_str == cwd_str then
+		ya.emit("bulk_create", {})
+		return
+	end
+
+	ya.dbg("[tree-dbg] bulk_create target=", target_str)
+	ya.async(function()
+		if not operations then
+			require("tree.operations") -- async context: safe here
+			operations = package.loaded["tree.operations"]
+		end
+		operations.bulk_create({
+			target_str = target_str,
+			cwd_str = cwd_str,
+			create_after = create_after,
+		})
+	end)
+end
+
 -- p / P: paste into the hovered tree level. A cwd destination (root-level file,
 -- or no hover) delegates to stock paste for exact parity; otherwise every
 -- yanked source is spawned as one native copy/move task. Cut clears the yank
@@ -1300,7 +1293,7 @@ function M:paste(args)
 
 	local h = hovered()
 	local cwd_str = tostring(cx.active.current.cwd)
-	local dest = h and (h.cha and h.cha.is_dir and h.url or h.url.parent) or nil
+	local dest = h and (h.stat and h.stat.is_dir and h.url or h.url.parent) or nil
 	if not dest or tostring(dest) == cwd_str then
 		ya.emit("paste", { force = force, follow = follow })
 		return
@@ -1371,7 +1364,7 @@ end
 function M:open()
 	if active_tree() then
 		local h = hovered()
-		if h and h.cha.is_dir then
+		if h and h.stat.is_dir then
 			ya.emit("enter", {})
 			return
 		end
@@ -1454,10 +1447,9 @@ function M:filter()
 	ya.dbg("[tree-dbg] filter input opened")
 	ya.async(function()
 		-- Stock popup parity: the input always opens blank (value defaults to
-		-- ""), with the shared filter history, and opening emits no filter
-		-- change. An existing hierarchy-aware query therefore stays applied
-		-- until the first realtime typed value replaces it, exactly like
-		-- Yazi's native `filter` popup over a live native filter.
+		-- ""), with the shared filter history, so an existing hierarchy-aware
+		-- query stays applied until the first realtime typed value replaces it,
+		-- exactly like Yazi's native `filter` popup over a live native filter.
 		local stream = ya.input({
 			name = "filter",
 			title = "Filter: ",
@@ -1855,22 +1847,20 @@ function M:setup(opts)
 	end
 
 	-- Save/restore per-tab/per-root expansion state whenever the root changes.
-	-- Registered once.
 	if not cd_subscribed then
 		cd_subscribed = true
 		ps.sub("cd", on_cd)
 	end
 
-	-- Isolate saved roots by tab: switching or creating a tab restores that
-	-- tab's own state instead of leaking the previous tab's hierarchy in.
+	-- Isolate saved roots by tab, so switching never leaks the previous
+	-- hierarchy in.
 	if not tab_subscribed then
 		tab_subscribed = true
 		ps.sub("tab", on_tab)
 	end
 
-	-- Setup-installed mutation event reconciliation. events.lua owns the
-	-- rename/bulk-rename and remove/transfer policy; the bounded controller
-	-- keeps every read and write of M in main.lua.
+	-- Setup-installed mutation reconciliation; events.lua owns the policy,
+	-- main.lua the M access.
 	if not events then
 		require(".events") -- runs in init.lua's async context
 		-- Raw module table: plain sync handlers, no per-event require proxy.
@@ -1898,7 +1888,6 @@ function M:setup(opts)
 		commit_mutation = commit_mutation,
 	})
 
-	-- Remap/rebuild the injected hierarchy when rows are renamed.
 	if not mutate_subscribed then
 		mutate_subscribed = true
 		ps.sub("rename", mutation.on_rename)
@@ -1913,7 +1902,6 @@ function M:setup(opts)
 		ps.sub("key-hidden", on_key_hidden)
 	end
 
-	-- Successful copy/move completion: refresh the affected injected branches.
 	if not transfer_subscribed then
 		transfer_subscribed = true
 		ps.sub("duplicate", mutation.on_transfer("duplicate"))
@@ -2098,6 +2086,8 @@ function M:entry(job)
 		M:open()
 	elseif action == "create" then
 		M:create(args)
+	elseif action == "bulk_create" then
+		M:bulk_create(args)
 	elseif action == "paste" then
 		M:paste(args)
 	elseif action == "focus" then

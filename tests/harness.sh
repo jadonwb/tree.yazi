@@ -113,6 +113,10 @@ on = "a"
 run = "plugin tree create"
 
 [[mgr.prepend_keymap]]
+on = "A"
+run = "plugin tree bulk_create"
+
+[[mgr.prepend_keymap]]
 on = "p"
 run = "plugin tree paste"
 
@@ -412,6 +416,20 @@ cp "\$1" "$DIR/selected.txt"
 exit 0
 SH
 	chmod +x "$DIR/editor.sh"
+}
+
+# Deterministic bulk-create editor: copies a caller-provided $DIR/bulk_input
+# verbatim into the editor's argument ($1) and touches $DIR/bulk_editor_ran.
+# The marker is what a scenario asserts to prove the editor ran, which is also
+# how a stock-delegation check observes that the stock bulk path was reached.
+make_bulk_create_editor() {
+	cat >"$DIR/bulk_editor.sh" <<SH
+#!/bin/sh
+cp "$DIR/bulk_input" "\$1"
+touch "$DIR/bulk_editor_ran"
+exit 0
+SH
+	chmod +x "$DIR/bulk_editor.sh"
 }
 
 # ---------------------------------------------------------------------------

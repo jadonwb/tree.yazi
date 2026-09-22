@@ -100,9 +100,9 @@ local MOD_METHODS = {
 	crossed = "crossed",
 }
 
--- The outer ui.Line style paints the whole row before spans run (ratatui
--- set_style), so the connector inherits the hover indicator. A span can only
--- set fields, never clear them, so invert exactly the fields the active
+-- The outer ui.Line style is intended to paint the whole row before spans run
+-- (ratatui set_style), so the connector inherits the hover indicator. A span can
+-- only set fields, never clear them, so invert exactly the fields the active
 -- indicator sets. `style` is th.indicator.current in this pane.
 function M.unhighlight(style)
 	local cancel = ui.Style()
@@ -116,9 +116,7 @@ function M.unhighlight(style)
 	for key, method in pairs(MOD_METHODS) do
 		local value = raw[key]
 		if value ~= nil then
-			-- The binding's modifier methods take `remove`: passing true moves
-			-- the modifier into sub_modifier (which Cell::set_style removes),
-			-- so the raw value is exactly the argument that inverts it.
+			-- Passing true moves the modifier into sub_modifier, i.e. removes it.
 			cancel = cancel[method](cancel, value)
 		end
 	end
@@ -166,7 +164,7 @@ function M.install(caps)
 	return true
 end
 
--- Reset the per-enable log-once diagnostics so the next tree frame logs again.
+-- Reset the per-enable log-once diagnostics (next tree frame logs again).
 function M.reset_logs()
 	logged_redraw = false
 	logged_open_icon = false
@@ -176,8 +174,8 @@ end
 -- prefixing every injected descendant (depth > 0) with connectors that stay
 -- correct at any depth. Root rows stay flush-left. One ui.Line per item keeps
 -- row i aligned with the folder cursor. The connector span cancels the hover
--- indicator; the outer line style still fills the entity region through the
--- right edge exactly like stock.
+-- indicator; the outer line style is intended to fill the entity region through
+-- the right edge like stock.
 local function redraw_tree(self)
 	local folder = self._folder
 	local files = folder.window
@@ -236,7 +234,7 @@ local function redraw_tree(self)
 		local pw = ui.width(prefix)
 
 		local entity = Entity:new(f)
-		if f.cha and f.cha.is_dir and expanded[tostring(f.url)] then
+		if f.stat and f.stat.is_dir and expanded[tostring(f.url)] then
 			entity.icon = open_icon
 			open_dirs[#open_dirs + 1] = tostring(f.name)
 		end

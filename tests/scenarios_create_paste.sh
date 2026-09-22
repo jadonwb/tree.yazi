@@ -395,3 +395,85 @@ scenario_cut_paste_keeps_selection() {
 	assert_log_clean
 	stop_session
 }
+
+# Bulk create: the editor's multi-path buffer is created under the hovered
+# expanded directory (not the cwd), a trailing separator makes a directory, a
+# nested path builds intermediates, and the first created row is focused. A
+# root-level hover delegates to stock, whose editor marker proves the stock path
+# ran and whose decline creates nothing.
+scenario_bulk_create() {
+	new_env bulk_create
+	write_config true adopt
+	make_fixture_create
+	make_bulk_create_editor
+	printf 'newfile.txt\nnewdir/\nsub/nested.txt\n' >"$DIR/bulk_input"
+	launch "$FIXTURE" "EDITOR='$DIR/bulk_editor.sh'"
+
+	hovered_is 'alpha'
+	send_key l
+	settle 1.0
+	hovered_is 'alpha' "expand the destination"
+	send_key A
+	wait_file_exists "$DIR/bulk_editor_ran" 15 "the editor should run for a hovered directory"
+	wait_pane_has 'Continue to create?'
+	send_key y
+	wait_file_exists "$FIXTURE/alpha/newfile.txt" 15
+	wait_file_exists "$FIXTURE/alpha/sub/nested.txt" 15
+	[ -d "$FIXTURE/alpha/newdir" ] || fail "trailing separator should create a directory under the hovered dir"
+	file_absent "$FIXTURE/newfile.txt" "bulk create must not join to the tab cwd"
+	file_absent "$FIXTURE/newdir"
+	header_has "$FIXTURE"
+	header_lacks "$FIXTURE/alpha" "bulk create must not change cwd"
+	wait_pane_has 'newfile.txt'
+	hovered_is 'newfile.txt' "focus follows the first created row"
+
+	# A root-level hover resolves to cwd and delegates to stock bulk create.
+	rm -f "$DIR/bulk_editor_ran"
+	send_key h
+	settle 1.0
+	hovered_is 'alpha' "collapse the destination"
+	send_key j
+	settle 0.4
+	hovered_is 'rootfile.txt'
+	send_key A
+	wait_file_exists "$DIR/bulk_editor_ran" 15 "a root-level hover must delegate to stock bulk create"
+	wait_pane_has 'Continue to create?'
+	send_key n
+	settle 1.2
+	file_absent "$FIXTURE/newfile.txt"
+	file_absent "$FIXTURE/newdir"
+
+	snapshot bulk_create
+	assert_log_clean
+	stop_session
+}
+
+# Bulk create collision: an entry matching an existing file must not overwrite
+# it (create_new is O_EXCL), the failure is reported, and the other entries are
+# still created.
+scenario_bulk_create_collision() {
+	new_env bulk_create_collision
+	write_config true adopt
+	make_fixture_create
+	make_bulk_create_editor
+	printf 'existing.txt\nfresh.txt\n' >"$DIR/bulk_input"
+	launch "$FIXTURE" "EDITOR='$DIR/bulk_editor.sh'"
+
+	hovered_is 'alpha'
+	send_key l
+	settle 1.0
+	hovered_is 'alpha'
+	send_key A
+	wait_file_exists "$DIR/bulk_editor_ran" 15 "the editor should run"
+	wait_pane_has 'Continue to create?'
+	send_key y
+	wait_file_exists "$FIXTURE/alpha/fresh.txt" 15
+	file_content_is "$FIXTURE/alpha/existing.txt" 'EXIST'
+	wait_pane_has 'Failed to create' 15 "the collision should be reported"
+	pane_has 'existing.txt'
+	hovered_is 'fresh.txt' "focus follows the first successfully created row"
+
+	snapshot bulk_create_collision
+	assert_log_clean
+	stop_session
+}

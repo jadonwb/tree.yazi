@@ -33,9 +33,8 @@ local function has_base()
 	return base ~= nil
 end
 
--- A tab is idle (tree off, preview on) when its live ratio already equals the
--- canonical base, so an external ratio change observed now (manual config,
--- toggle-pane, etc.) is safe to adopt as the new base.
+-- A tab is idle when tree is off and preview is on; an external ratio change
+-- observed then (manual config, toggle-pane, etc.) replaces the canonical base.
 local function is_idle(t)
 	return t ~= nil and not t.tree and t.preview
 end
@@ -132,7 +131,6 @@ local function pin_sort_for(t)
 	end
 end
 
--- Restore a tab's configured sort preferences when it leaves tree mode.
 local function restore_sort_for(t)
 	if not t or not t.sort_saved then
 		return

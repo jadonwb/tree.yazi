@@ -177,7 +177,7 @@ function M.sort_children(files, pref)
 	end
 
 	local function ext_key(f)
-		if f.cha and f.cha.is_dir then
+		if f.stat and f.stat.is_dir then
 			return ""
 		end
 		local n = tostring(f.name)
@@ -191,20 +191,20 @@ function M.sort_children(files, pref)
 
 	local function primary(f)
 		if by == "mtime" then
-			return (f.cha and f.cha.mtime) or 0
+			return (f.stat and f.stat.mtime) or 0
 		elseif by == "btime" then
-			return (f.cha and f.cha.btime) or 0
+			return (f.stat and f.stat.btime) or 0
 		elseif by == "extension" then
 			return ext_key(f)
 		elseif by == "size" then
-			return (f.cha and f.cha.len) or 0
+			return (f.stat and f.stat.len) or 0
 		end
 		return name_key(f)
 	end
 
 	table.sort(files, function(a, b)
-		local ad = (a.cha and a.cha.is_dir) and true or false
-		local bd = (b.cha and b.cha.is_dir) and true or false
+		local ad = (a.stat and a.stat.is_dir) and true or false
+		local bd = (b.stat and b.stat.is_dir) and true or false
 		if dir_first and ad ~= bd then
 			return ad
 		end
@@ -268,7 +268,8 @@ function M.sort_children(files, pref)
 end
 
 -- Smart-case, literal (non-regex) basename substring match. A query holding an
--- uppercase character is case-sensitive, otherwise matching is case-folded.
+-- ASCII uppercase character is case-sensitive, otherwise matching is
+-- case-folded (case detection uses `%u`, unlike Yazi's Unicode `is_uppercase()`).
 function M.match_name(name, query)
 	if not query or query == "" then
 		return true

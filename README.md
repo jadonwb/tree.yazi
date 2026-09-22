@@ -1,31 +1,34 @@
 # tree.yazi
 
-An experimental Yazi plugin exploring a live, recursive, navigable tree view of
+An experimental Yazi plugin that adds a live, recursive, navigable tree view of
 the current directory, plus an independent preview-pane toggle.
 
-**Status: arbitrary-depth lazy expansion.** When tree mode is on, the plugin
-renders the current directory's existing rows flush-left and lets you expand any
-safe directory in place, one level at a time. Expanded directories inject their
-real children directly after them, so every subtree stays grouped beneath its
-parent and renders with compact branch connectors that stay correct at any
-depth. Collapsing prunes the whole subtree again. Because the injected rows are
-real filesystem entries in the active folder, navigation, hover, selection,
-mouse, and drag/drop all use Yazi's native `Folder` cursor and
-`Entity`/`Linemode` rendering.
+TODO: add a demo video or screenshots
 
-What the plugin does today:
+**Status: arbitrary-depth lazy expansion.** When tree mode is on, the plugin
+renders the current directory's existing rows flush-left and expands any safe
+directory in place, one level at a time. Expanded directories inject their real
+children directly after them, so every subtree stays grouped beneath its parent
+and renders with compact branch connectors that stay correct at any depth.
+Collapsing prunes the whole subtree again. Because the injected rows are real
+filesystem entries in the active folder, navigation, hover, selection, mouse,
+and drag/drop all use Yazi's native `Folder` cursor and `Entity`/`Linemode`
+rendering.
+
+Behavior:
 
 - **Tree mode** (`toggle`) collapses the parent column into the current pane and
   enables expand/collapse navigation.
 - **Preview mode** (`preview`) toggles the preview pane; turning it off gives
   the preview space to the current pane.
 
-Both toggles are tab-local, creating a new tab in tree mode carries it over.
+Both toggles are tab-local: switching back to a tab restores its modes, and a
+new tab inherits the previous tab's modes.
 
-The plugin provides (`plugin tree tab_create`): in a tree tab it emits the tree
-cwd as an explicit `tab_create` target, so a new tab opens at the same tree root
-even when a nested injected descendant is hovered; outside tree mode the action
-re-emits stock `tab_create --current` unchanged.
+`plugin tree tab_create` in a tree tab emits the tree cwd as an explicit
+`tab_create` target, so a new tab opens at the same tree root even when a nested
+injected descendant is hovered; outside tree mode the action re-emits stock
+`tab_create --current` unchanged.
 
 The two toggles are independent and compose, so all four combinations restore
 predictably:
@@ -37,60 +40,65 @@ predictably:
 | off  | off     | preview space in current                  |
 | on   | off     | parent and preview space in current       |
 
-The plugin captures one canonical base ratio from `rt.mgr.ratio` while the
-active tab is idle (tree off, preview on), recomposes each tab's effective ratio
-from that base and its own modes, and applies it with `rt.mgr.ratio = ...` plus
+One canonical base ratio is captured from `rt.mgr.ratio` while the active tab is
+idle (tree off, preview on); each tab's effective ratio is recomposed from that
+base and its own modes and written with `rt.mgr.ratio = ...` plus
 `ya.emit("app:resize", {})`. Yazi keeps a single global ratio, so an inactive
-tab's layout is only observable once it becomes active; the plugin does not
-patch `Tab.layout` or `Tab._chunks`.
+tab's layout is only observable once it becomes active; the preset `Tab`
+component's `layout` and `_chunks` fields are left untouched.
 
 ## Limitations
 
 - **Symlinked directories are never expanded.** A symlink to a directory is
-  shown as a directory and can be entered with `Enter`/`L`, but `l` refuses to
-  descend into it (logged at debug level) so a self-referential link cannot
-  recurse forever. There is no follow mode and no inode-based cycle detection.
+  shown as a directory and can be entered with `plugin tree open` or
+  `plugin tree root_down`, but `plugin tree right` refuses to descend into it
+  (logged at debug level), so a self-referential link cannot recurse forever.
+  There is no follow mode: the plugin refuses symlinked and indirect directories
+  outright rather than guarding cycles. Lua cannot read inode numbers, but it
+  can read the `(dev, btime)` identity the poller already uses, so an
+  ancestor-chain cycle check would be implementable if follow mode were added.
 - **Unlimited, uncached reads.** Each rebuild asynchronously re-reads the root
-  and every reachable expanded directory without passing `fs.read_dir`'s
+  and every reachable expanded directory, without passing `fs.read_dir`'s
   `options.limit` and with no children cache, so a rebuild's I/O is proportional
-  to the total entries of the expanded directories, not just the visible window.
-- **External changes below the root are polled, not watched.** Yazi's watcher
-  covers only the current, parent, and hovered folders, non-recursively, and
-  never adds or removes the injected descendants; a watched hovered nested
-  directory's own row metadata can still be refreshed by a watcher op. The
-  plugin polls once per second instead: it reads unfollowed metadata for the
-  active tab's expanded directories outside any hidden subtree while hidden is
-  off, coalescing a real change into one guarded rebuild, and detection is
-  delayed by up to roughly one interval plus a rebuild. An expanded directory
-  renamed within the reachable set is remapped by its `(dev, btime)` identity
-  and keeps its expansion; an unmatched, ambiguous, or out-of-tree move is
-  pruned. The poll also stat-follows the one hovered injected nested file, so a
-  content-only write to _that_ file still refreshes the preview; other
-  content-only writes may not be seen, in which case collapse (`h`) and
-  re-expand (`l`) the directory. A native Full reload is repaired through the
-  `load` event rather than polled, and create, rename, copy/move, and
-  trash/permanent-delete completed through the plugin or stock remove still
-  rebuild explicitly, with `duplicate`/`move` events refreshing affected
-  branches.
-- **Link/hardlink are not routed.** Stock `link`/`hardlink` always create links
-  in the current directory (their forms carry no target), and Lua exposes no
-  native task kind or `fs` call for them, so in tree mode they target the tab
-  cwd rather than the hovered level. A plugin could shell out to `ln`; tree.yazi
-  does not.
-- **Filter matching is literal, not regex.** The tree filter matches a
+  to the total entries of the expanded directories, including entries
+  off-screen. A limit would truncate each listing and break the branch/sort
+  invariants, and a children cache would have to be invalidated.
+- **External changes below the root are polled.** Yazi's watcher covers only the
+  current, parent, and hovered folders, non-recursively, and never adds or
+  removes the injected descendants; a watcher op can still refresh the row
+  metadata of a watched hovered nested directory. Lua has no API to add the
+  injected descendants to that non-recursive watch set, so the plugin polls once
+  per second: it reads unfollowed metadata for the active tab's expanded
+  directories outside any hidden subtree while hidden is off, coalesces a real
+  change into one guarded rebuild, and can lag by roughly one interval plus a
+  rebuild. An expanded directory renamed within the reachable set is remapped by
+  its `(dev, btime)` identity and keeps its expansion; an unmatched, ambiguous,
+  or out-of-tree move is pruned. The poll also stat-follows the one hovered
+  injected nested file, so a content-only write to _that_ file still refreshes
+  the preview; other content-only writes may go unseen, in which case run
+  `plugin tree left` and then `plugin tree right` on the directory. A native
+  Full reload is repaired through the `load` event, and create, rename,
+  copy/move, and trash/permanent-delete completed through the plugin or stock
+  remove still rebuild explicitly, with `duplicate`/`move` events refreshing
+  affected branches.
+- **Link/hardlink create at the tab cwd.** Stock `link`/`hardlink` always create
+  links in the current directory (their forms carry no target), and Lua exposes
+  no native task kind or `fs` call for them, so in tree mode they target the tab
+  cwd and ignore the hovered level.
+- **Filter matching is a literal substring.** The tree filter matches a
   smart-case basename substring. Yazi's native filter compiles the query as a
   Rust regex after a Unicode `Normalizer` rewrite, but a Lua plugin receives
   only the raw query string (`Files.filter` is an opaque userdata whose sole
   member is `__tostring`, with no `new`/`matches`/`highlighted` binding), so the
   plugin cannot call that engine.
-- **Filter case mode is not recoverable.** Yazi exposes only the raw query
+- **Filter case mode always uses smart case.** Yazi exposes only the raw query
   string to Lua, so a restored `adopt` or `suspend` query always uses smart
-  case; a native sensitive/insensitive choice is not preserved.
-- **The header indicator is added by wrapping `Header:flags`.**
-  `(filter: query)` comes from wrapping the preset `Header:flags`, which
-  delegates unchanged whenever tree mode is off or no tree query is active, so
-  the native indicator still appears outside tree mode and tree mode never shows
-  a duplicate.
+  case, and a native sensitive/insensitive choice is lost.
+- **The header indicator wraps `Header:flags`.** The wrapper supplies the query
+  through a synthetic `files.filter`, which the stock `Header:flags` formats,
+  and it delegates unchanged whenever tree mode is off or no tree query is
+  active, so the native indicator still appears outside tree mode and tree mode
+  never shows a duplicate.
 - **Interactive refresh reloads keep the injected rows and restore the hovered
   row.** A native Full reload (an explicit refresh, or window focus after an
   external save marks the folder stale) replaces the folder's entries, but when
@@ -101,148 +109,162 @@ patch `Tab.layout` or `Tab._chunks`.
   dispatch can still show the flat depth-0 listing for one frame (see the
   Full-reload-flash limitation below), and the cursor then stays put. If the
   reload lands while a rebuild is already in flight the repair is skipped, so
-  collapse (`h`) and re-expand (`l`) as a fallback. Changing the working
-  directory restores that root's saved expansion set automatically
+  run `plugin tree left` and then `plugin tree right` as a fallback. Changing
+  the working directory restores that root's saved expansion set automatically
   (asynchronously when Yazi evicted its cached Folder), and renames, bulk
   renames, removals, and hidden toggles are handled automatically. External
-  mutations inside a saved root while it is not active are not observed
+  mutations inside a saved root while it is not active are not noticed
   ("external" meaning not performed through this Yazi instance; a
   rename/trash/delete/move performed in this Yazi prunes every tab's saved
-  state), so a saved key for a path deleted behind its back can remain until you
-  return and collapse it; a directory later recreated at the same URL can then
-  resurrect that stale expansion.
-- **A native Full reload can flash one frame.** A native full reload — window
-  focus after an external save within the tree root, or an explicit `refresh` —
-  may paint the flat `sort=none` cwd for one frame before the local `load` event
-  replays the recorded rows; expansions and the hovered row are preserved. The
-  frame cannot be masked: a Full load has no variant-aware preflight — the
-  generic relay preflight sees the op, but Lua cannot identify it as Full — and
-  the Lua `FilesOp` exposes no variant, so Lua cannot substitute one.
-- **Custom sort has no equivalent.** While tree mode pins the tab's folder sort
-  to `none` the plugin emulates the captured sort per directory; `by = "custom"`
-  falls back to alphabetical because native ranks key by basename on a single
-  folder, so injected descendants from different subdirectories would collide. A
-  `size` sort compares the entry's own `stat.len`, not a recursive directory
-  size. The `extension` key is also not faithful: the plugin splits on the last
-  dot, so a dotfile with no other dot (`.bashrc`) gets extension `bashrc`, while
-  Yazi returns no extension.
-- **Collisions are handled differently by `a` and `A`.** Target-aware create
-  overwrites an existing regular file in place with `fs.write` (and unlinks an
-  existing symlink, never its target), while bulk create binds file entries to
-  `create_new` (`O_CREAT|O_EXCL`), so an existing _file_ is reported as a
-  failure and is never overwritten, while an existing _directory_ entry is
-  silently accepted (`create_dir_all` succeeds and is counted as created).
+  state), so a saved key for a path deleted behind its back persists while the
+  root is inactive; when you next return, the rebuild revalidates the saved set
+  against disk and drops the missing key. A directory recreated at that same
+  path before you return matches the saved key and resurrects the expansion.
+- **A native Full reload can flash one frame.** A native full reload happens on
+  window focus after an external save to a direct child of the root, or on an
+  explicit `refresh`. It may paint the flat `sort=none` cwd for one frame before
+  the local `load` event replays the recorded rows; expansions and the hovered
+  row are preserved. The frame cannot be masked: a Full load has no
+  variant-aware preflight. The generic relay preflight sees the op, but Lua
+  cannot identify it as Full, and the Lua `FilesOp` exposes no variant, so Lua
+  cannot substitute one.
+- **Custom sort falls back to alphabetical.** While tree mode pins the tab's
+  folder sort to `none` the captured sort is applied per directory, but
+  `by = "custom"` falls back to alphabetical because the custom rank map is not
+  exposed to Lua at all, and even with it the ranks are keyed by basename on a
+  single folder, so injected descendants from different subdirectories would
+  collide. A `size` sort compares the entry's own `stat.len` and does not
+  recurse into directories, because Yazi's recursive directory sizes arrive
+  through a separate `Size` op that injected rows never receive. The `extension`
+  key also differs: the plugin splits on the last dot, so a dotfile with no
+  other dot (`.bashrc`) gets extension `bashrc`, while Yazi returns no extension
+  because it uses Rust's `Path::extension`, which treats a leading-dot-only name
+  as extensionless; the Lua port has only a last-dot split.
+- **Collisions are handled differently by `plugin tree create` and
+  `plugin tree bulk_create`.** Target-aware create overwrites an existing
+  regular file in place with `fs.write` (and unlinks an existing symlink,
+  because `fs.write` would otherwise follow the link and truncate its target),
+  while bulk create binds file entries to `create_new` (`O_CREAT|O_EXCL`), so
+  an existing _file_ is reported as a failure and left untouched, while an
+  existing _directory_ entry is silently accepted (`create_dir_all` succeeds and
+  is counted as created). The two actions diverge because single create is the
+  target-aware replacement path, while bulk create mirrors stock's per-file
+  `create_new` semantics.
 
 ## Architecture
 
-While tree mode is on, the plugin overrides `Current.redraw` and reproduces the
-stock row renderer over the pane's already-loaded folder window, one
+While tree mode is on, `Current.redraw` is replaced with a renderer that draws
+the stock row layout over the pane's already-loaded folder window, one
 `Entity:new(file):redraw()` per row, so hover, selection markers, linemode text,
-and drag/drop rendering stay native; root rows render flush-left and only
+and drag/drop rendering stay native. Root rows render flush-left and only
 injected descendants carry branch prefixes, and a non-tree or empty directory
 falls back to the unmodified stock renderer. Injected children must stay
 directly beneath their parent, and Yazi re-sorts a folder on every update, so
-tree mode pins the tab's folder sort to `none` and the plugin emulates the
-captured sort per directory, restoring the tab's own sort on exit. Expansion is
-lazy: only directories reachable through an expanded ancestor are read, each
-with asynchronous `fs.read_dir`, so a collapsed subtree costs no I/O.
+tree mode pins the tab's folder sort to `none` and applies the captured sort per
+directory, restoring the tab's own sort on exit. Expansion is lazy: only
+directories reachable through an expanded ancestor are read, each with
+asynchronous `fs.read_dir`, so a collapsed subtree costs no I/O.
 
-`main.lua` is the state owner and orchestrator: it holds `M` (the expansion
-sets, row metadata, generation counters, per-tab records, and the poller
-handle), registers the event subscriptions, and defines the synchronous bridges
-that let the async passes touch that state. The sibling modules are stateless
-helpers reached through those bridges and never hold `M`: `roots.lua` does URL
-remap, prune, and saved-root reconciliation; `layout.lua` owns the canonical
-base ratio, the effective-ratio composition, the single write of `rt.mgr.ratio`,
-and the per-tab sort pin/restore handoff; `rows.lua` holds the cursor,
-cwd-relative, and row-rehydration helpers over the active `cx` folder;
-`events.lua` reconciles externally-initiated mutation events (`rename`/
-`bulk-rename`, remove/transfer); `operations.lua` performs the plugin-initiated
-writes (target-aware create and nested rename); `rebuild.lua` runs the
-asynchronous rebuild that reads the expanded subtrees, flattens and filters them
-in the captured root order, publishes row metadata, and injects the resulting
-rows; `render.lua` holds the row-rendering primitives, connector configuration,
-private render style, and resolved glyph state; `flatten.lua` is the pure
-directory-first ordering, the smart-case literal matching, the Lua port of
-Yazi's natural sort, and a separate deterministic FNV-1a `(seed, url)`
-comparator that emulates random order (Yazi's own `SortBy::Random` draws from a
-fresh `SmallRng` per sort); `translit.lua` is the lazily loaded port of Yazi's
-translit table, used only for natural sort with `translit` true; and
-`poller.lua` is the setup-installed external-change loop whose bounded per-tick
-metadata scan drives one coalesced, generation-guarded rebuild through the apply
-bridge.
+`main.lua` holds `M` (the expansion sets, row metadata, generation counters,
+per-tab records, and the poller handle), registers the event subscriptions, and
+defines the synchronous bridges that let the async passes touch that state. The
+sibling modules are stateless helpers reached through those bridges and do not
+hold `M`:
 
-### Module contracts and state ownership
+- `roots.lua`: URL remap, prune, and saved-root reconciliation.
+- `layout.lua`: the canonical base ratio, the effective-ratio composition, the
+  single write of `rt.mgr.ratio`, and the per-tab sort pin/restore handoff.
+- `rows.lua`: the cursor, cwd-relative, and row-rehydration helpers over the
+  active `cx` folder.
+- `events.lua`: reconciliation of externally-initiated mutation events
+  (`rename`/`bulk-rename`, remove/transfer).
+- `operations.lua`: the plugin-initiated writes (target-aware create and nested
+  rename).
+- `rebuild.lua`: the asynchronous rebuild that reads the expanded subtrees,
+  flattens and filters them in the captured root order, publishes row metadata,
+  and injects the resulting rows.
+- `render.lua`: the row-rendering primitives, connector configuration, private
+  render style, and resolved glyph state.
+- `flatten.lua`: directory-first ordering, smart-case literal matching, a Lua
+  port of Yazi's natural sort, and a separate deterministic FNV-1a `(seed, url)`
+  comparator that emulates random order (Yazi's own `SortBy::Random` draws from
+  a fresh `SmallRng` per sort).
+- `translit.lua`: the lazily loaded port of Yazi's translit table, used only for
+  natural sort with `translit` true.
+- `poller.lua`: the setup-installed external-change loop whose bounded per-tick
+  metadata scan drives one coalesced, generation-guarded rebuild through the
+  apply bridge.
 
-`main.lua` owns the live state for the active tab: `M.expanded`, `M.rows`,
+### Module contracts and state
+
+`main.lua` holds the live state for the active tab: `M.expanded`, `M.rows`,
 `M.root_order`, and `M.filter_query`. Everything that must survive a tab switch
-lives on `M.tabs[tab_id]` — the tab's tree/preview modes, its sort and
+lives on `M.tabs[tab_id]`: the tab's tree/preview modes, its sort and
 native-filter handoff, its last-seen root, its frozen `random_seed`, and its
 per-root `roots[root] = { expanded, order, filter }` map. Entering a tab loads
 its saved state and leaving one saves it; Yazi restores a whole cached Folder on
-`cd`, and `update_files` always targets the active tab, so the plugin saves the
-outgoing tab itself and reconciles the incoming one against its saved set.
+`cd`, and the plugin's own `update_files` emissions target the active tab, so
+the outgoing tab is saved on exit and the incoming one is reconciled against its
+saved set.
 
-Sibling modules never hold `M`. Each reaches live state through a bound accessor
+Sibling modules do not hold `M`; each reads live state through a bound accessor
 installed once from `M:setup`: `roots.bind(accessors)`, `layout.bind`,
-`events.bind(ctl)`, `poller.start(token, ctx)`, and `render.install(caps)`;
+`events.bind(ctl)`, `poller.start(token, ctx)`, and `render.install(caps)`.
 `rows.lua` reads `cx` directly and returns values, and `render.lua`'s private
 style and resolved glyphs are read back only through `style()`/`glyphs()`. The
 bound accessors expose the live tables (not copies), so the in-place
-`prune`/`remap` helpers mutate the live expansion set, and `events.lua` performs
-no filesystem writes — the plugin's own writes live in `operations.lua`.
+`prune`/`remap` helpers mutate the live expansion set; `events.lua` performs no
+filesystem writes, and the plugin's own writes live in `operations.lua`.
 
 Async passes are resolved lazily: each is `require`d inside its own existing
 `ya.async` callback, or bound once in `setup()` from the async `init.lua`
 context, so no module is loaded on a synchronous path that cannot require it.
 
-A completed rebuild injects one `FilesOp` sequence — `part` (empty) + `part`
-(the rows) + `done` — under a ticket taken from `M.seq`, which starts above the
-folder loader's own tickets. Before injection the rebuild stashes a plain-table
-replay snapshot (`inject_snapshot`/`inject_cwd`/`inject_tab`/`has_descendants`);
-the synchronous `on_load` repair replays it (rebuilding fresh `File` userdata,
-since `Stat`/`File` userdata cannot cross the sync bridge — a `Path` could, but
-the stash stores strings) only when it recorded `depth > 0` rows. Every `set_*`
+A completed rebuild injects one `FilesOp` sequence, `part` (empty) + `part` (the
+rows) + `done`, under a ticket taken from `M.seq`, which starts above the folder
+loader's own tickets. Before injection the rebuild stashes a plain-table replay
+snapshot (`inject_snapshot`/`inject_cwd`/`inject_tab`/`has_descendants`). The
+synchronous `on_load` repair replays it only when it recorded `depth > 0` rows;
+it rebuilds fresh `File` userdata because `Stat`/`File` userdata cannot cross
+the sync bridge (a `Path` could, but the stash stores strings). Every `set_*`
 bridge and `finish_rebuild` is gated on generation and tab, so a stale or
 cross-tab callback cannot reset a folder.
 
-`M.pending_focus` is either a URL string or an ordered candidate list; `M:focus`
+`M.pending_focus` is either a URL string or an ordered candidate list. `M:focus`
 resolves it against the rebuilt files, skipping a fallback hidden by the active
-tree filter. The plugin owns `M.filter_query` and keeps Yazi's native `Entries`
-filter cleared for the whole injected-tree lifetime, with the raw query parked
-per tab in `t.suspended_filter`. Poll sessions carry an identity
+tree filter. `M.filter_query` holds the active tree query while Yazi's native
+`Entries` filter stays cleared for the whole injected-tree lifetime, and the raw
+query is parked per tab in `t.suspended_filter`. Poll sessions carry an identity
 (`poll_token`/`M.poller_token`): a newer session makes an older loop drop its
 tick, and abort/finish clears the snapshot.
 
 ### Native fd/rg search views
 
-A native `fd://`/`rg://` provider View is never a tree View: `active_tree()`
-returns false for it regardless of the tab's recorded mode, so provider rows,
-stock rendering, stock actions, and the stock rebuild all delegate untouched.
-The mode is still recorded on the tab, and sort pin/restore is deferred to the
-next physical `cd`; stock EscapeView (which cds back to the physical root) is
-never intercepted, and the poll loop stops for the provider View and starts
-again on a physical tree.
+`active_tree()` returns false for a native `fd://`/`rg://` provider View
+regardless of the tab's recorded mode, so provider rows, stock rendering, stock
+actions, and the stock rebuild all delegate untouched. The mode is still
+recorded on the tab, and sort pin/restore is deferred to the next physical `cd`;
+stock EscapeView (which cds back to the physical root) runs untouched, and the
+poll loop stops for the provider View and starts again on a physical tree.
 
 ## Interoperability
 
 Yazi has no generic action-interception bus for `paste`, `create`, `rename`,
 `link`, or `hardlink`, so a plugin cannot preflight, redirect, or cancel them. A
 keybinding or another plugin that emits a stock action therefore bypasses the
-plugin's tree routing: paste/create/bulk_create/link/hardlink resolve against
-the tab cwd, while stock rename acts on the hovered row and reveals its result
-(which can reroot the view) — `ya.emit("paste", ...)`, for example, pastes into
-the tab cwd, not into a hovered tree level. Yazi does have a preflight bus, but
-only for a fixed, non-generic action set (the plugin itself uses `key-sort`/
+tree routing: paste/create/bulk_create/link/hardlink resolve against the tab
+cwd, while stock rename acts on the hovered row and reveals its result (which
+can reroot the view). `ya.emit("paste", ...)`, for example, pastes into the tab
+cwd, not into a hovered tree level. Yazi does have a preflight bus, but only for
+a fixed, non-generic action set (the plugin itself uses `key-sort`/
 `key-hidden`); it has no create/paste/rename/link/hardlink variants.
 
-Tree.yazi does not attempt such interception. It reconciles mutations started
-elsewhere only through the post-hoc `rename`, `bulk-rename`, `trash`, `delete`,
-`duplicate`, and `move` DDS events, which remap (rename/bulk-rename), prune
-(trash/delete/move), or merely refresh affected branches (duplicate); actions
-with no corresponding event are simply not routed into the tree. Cross-plugin
-calls can require the plugin module, use a DDS custom kind, or emit the `plugin`
-action.
+Mutations started elsewhere are reconciled only through the post-hoc `rename`,
+`bulk-rename`, `trash`, `delete`, `duplicate`, and `move` DDS events:
+rename/bulk-rename remap, trash/delete/move prune, and duplicate refreshes
+affected branches. Actions with no corresponding event are not routed into the
+tree. Cross-plugin calls can require the plugin module, use a DDS custom kind,
+or emit the `plugin` action.
 
 ## Installation
 
@@ -342,34 +364,37 @@ run = "plugin tree tab_create"
 desc = "Tree: new tab in tree cwd or stock smart tab"
 ```
 
-Outside a tree-mode tab the `h`, `l`, `H`, `L`, `<Enter>`, `a`, `A`, `p`, and
-`P` bindings re-emit Yazi's stock `leave`, `enter`, `back`, `forward`, `open`,
-`create`, `bulk_create`, and `paste`/`paste --force` actions, and `f`/`<Esc>`
-re-emit the stock `filter` and `escape` actions, so normal navigation, creation,
-bulk creation, paste, and filtering are unchanged. The `r` binding re-emits
-stock rename with `cursor = "before_ext"` outside tree mode, on root-level rows,
-and with an active multi-selection, so ordinary renames and bulk renames keep
-stock caret placement and behavior. When tree mode is on but no tree filter is
-active, `<Esc>` also falls through to the stock escape cascade. The `t t`
-binding opens a new tab at the tree cwd in tree mode (ignoring the hover) and
-otherwise re-emits stock `tab_create --current`, so ordinary smart-tab behavior
-is unchanged. Mode routing is per-tab, so these fallbacks apply based on the
-active tab's own tree flag.
+Outside a tree-mode tab the `plugin tree left`, `plugin tree right`,
+`plugin tree root_up`, `plugin tree root_down`, `plugin tree open`,
+`plugin tree create`, `plugin tree bulk_create`, `plugin tree paste`, and
+force-paste (`plugin tree -- paste --force`) actions emit Yazi's stock `leave`,
+`enter`, `back`, `forward`, `open`, `create`, `bulk_create`, and
+`paste`/`paste --force` actions, and `plugin tree filter`/`plugin tree escape`
+emit the stock `filter` and `escape` actions, so normal navigation, creation,
+bulk creation, paste, and filtering are unchanged. The `plugin tree rename`
+action emits stock rename with `cursor = "before_ext"` outside tree mode, on
+root-level rows, and with an active multi-selection, so ordinary renames and
+bulk renames keep stock caret placement and behavior. When tree mode is on but
+no tree filter is active, `plugin tree escape` also falls through to the stock
+escape cascade. The `plugin tree tab_create` action opens a new tab at the tree
+cwd in tree mode (ignoring the hover) and otherwise emits stock
+`tab_create --current`, so ordinary smart-tab behavior is unchanged. Mode
+routing is per-tab, so these fallbacks apply based on the active tab's own tree
+flag.
 
-The force-paste binding uses the `plugin <name> -- <args>` form because Yazi's
+The force-paste action uses the `plugin <name> -- <args>` form because Yazi's
 `--` separator is what keeps `--force` inside the plugin's own argument list. A
 plain `plugin tree paste --force` would parse `--force` as an argument of the
 outer `plugin` action and drop it before the plugin sees it.
 
-Note that the keybindings above are just examples, please tune them up as needed
-to ensure they don't conflict with your other actions/plugins.
+The keybindings above are examples; adjust them if they conflict with your other
+actions or plugins.
 
 ## Configuration
 
 Call `setup()` once in your `~/.config/yazi/init.lua`. It accepts a single table
 with four optional keys; every key is independent, and omitting the table (or a
-key) keeps the documented default. This block is the single source of truth for
-every `setup()` option.
+key) keeps the documented default. All `setup()` options are listed here.
 
 ```lua
 require("tree"):setup({
@@ -394,9 +419,9 @@ require("tree"):setup({
 	--   "clear"   discard it permanently
 	filter_mode = "adopt",
 
-	-- State seeded into tabs the plugin first observes without a creating tab
-	-- (boot tabs and tabs first seen via `cd`); tabs created by
-	-- `plugin tree tab_create` inherit the creator tab's tree/preview modes.
+	-- Modes for the tab Yazi opens with, applied before the first frame so it
+	-- starts with them without a flash. New tabs inherit the previous tab's
+	-- modes.
 	--   tree    false (default) tree mode off
 	--   preview true  (default) preview pane on
 	startup = { tree = false, preview = true },
@@ -422,8 +447,9 @@ and does not log the completion line.
 
 The integration harness in `tests/` drives the plugin through a private tmux
 server and an isolated Yazi config, so it never touches your real config,
-fixtures, or tmux sessions. It requires Bash, Yazi `26.9.1` at revision
-`0ea4c5d`, and `tmux`.
+fixtures, or tmux sessions. It requires Bash, a Yazi build reporting version
+26.9.1 at revision `0ea4c5d` (post-tag; the v26.9.1 release is `8dd895c`), and
+`tmux`.
 
 ```sh
 ./tests/integration.sh                 # run every scenario

@@ -140,7 +140,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Current.redraw pass. Only setup() installs this (there is no sync entry path
 -- to it), so main.lua keeps the stock renderer until install() runs. Mutable
--- plugin state (M.rows/M.expanded) stays owned by main.lua and is read through
+-- plugin state (M.rows/M.expanded) lives in main.lua and is read through
 -- the accessors bound here; nothing in this module writes plugin state.
 -- ---------------------------------------------------------------------------
 

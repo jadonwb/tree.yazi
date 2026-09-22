@@ -135,8 +135,8 @@ function M.run(ctx)
 	end
 
 	-- Hierarchy-aware visibility: a row is kept when its basename matches
-	-- the query or it owns a matching descendant through an expanded
-	-- directory. Unexpanded subtrees stay opaque (lazy expansion).
+	-- the query or it has a matching expanded descendant. Unexpanded
+	-- subtrees stay opaque (lazy expansion).
 	local visible_memo = {}
 	local function is_visible(f)
 		-- Hidden suppression must run before the filter test so a hidden

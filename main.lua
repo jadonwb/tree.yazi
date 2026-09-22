@@ -93,7 +93,7 @@ M.poller = nil -- ya.async Handle of the active external-change poll loop
 M.poller_token = nil -- identity of the loop M.poller currently refers to
 
 -- Per-tab / per-root persistence. M.expanded/M.rows/M.root_order/M.filter_query
--- stay the live state for the active tab, while M.tabs owns everything that must
+-- stay the live state for the active tab, while M.tabs holds the state that must
 -- survive a tab switch: the tab's tree/preview modes, its sort/native-filter
 -- handoff, its last-seen root, and its per-root expansion/order/tree-filter map.
 -- Yazi restores a whole cached Folder (with the plugin's injected rows) on cd,
@@ -742,7 +742,7 @@ end
 local poll_token = 0
 
 -- Snapshot the active tree session for one tick. Runs in the sync context (with
--- M/cx access). Returns nil when the plugin no longer owns the active view
+-- M/cx access). Returns nil when tree mode no longer applies to the active view
 -- (tree off, classic tab, or a native fd/rg provider View) or when this loop has
 -- been superseded, which makes the caller stop.
 local poll_scope = ya.sync(function(_, token)
@@ -1410,7 +1410,7 @@ end
 
 -- Tree-aware filtering: Yazi's native filter has no event/preflight hook and
 -- cannot keep injected descendants attached to their parents, so the plugin
--- owns the query.
+-- tracks the query itself.
 
 -- Rebuild after an event-free external change (hidden toggle, realtime filter).
 function M:reassert()
@@ -1859,8 +1859,8 @@ function M:setup(opts)
 		ps.sub("tab", on_tab)
 	end
 
-	-- Setup-installed mutation reconciliation; events.lua owns the policy,
-	-- main.lua the M access.
+	-- Setup-installed mutation reconciliation; events.lua defines the policy,
+	-- main.lua does the M access.
 	if not events then
 		require(".events") -- runs in init.lua's async context
 		-- Raw module table: plain sync handlers, no per-event require proxy.

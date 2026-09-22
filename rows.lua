@@ -99,7 +99,7 @@ local function rehydrate_rows()
 end
 
 -- Directories-first alphabetical depth-0 URL order from the folder's real
--- children, or nil when none are loaded yet. main.lua owns the guard checks
+-- children, or nil when none are loaded yet. main.lua performs the guard checks
 -- (root_order/expanded already set, native provider View) and the M writes.
 local function seed_root_order()
 	local cwd = cx.active.current.cwd
@@ -131,8 +131,8 @@ end
 
 -- Synchronously remove restored descendant rows. Emits the same part/part/done
 -- sequence rebuild uses, reusing the current Folder's depth-0 File userdata so
--- no filesystem read is needed. Emits only; the caller owns the ticket
--- allocation and the injected/injecting flags.
+-- no filesystem read is needed. Emits only; the caller allocates the ticket
+-- and sets the injected/injecting flags.
 local function strip_descendants(ticket)
 	local files, cwd = cx.active.current.files, cx.active.current.cwd
 	local cwd_str = tostring(cwd)

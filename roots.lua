@@ -149,8 +149,8 @@ end
 -- Apply `resolve` to every tab's saved roots, saved expansion keys, and saved
 -- root-order entries, plus each tab's last-seen root. Collected first, then
 -- re-keyed, so swaps/chains resolve against the untouched originals. Every tab
--- is visited, not just the active one, so a mutation performed from a classic
--- tab can never leave a tree tab's frozen roots pointing at a moved URL.
+-- is visited, so a mutation performed from a classic tab cannot leave a tree
+-- tab's frozen roots pointing at a moved URL.
 --
 -- A root's *own* URL usually does not move when a path inside it is renamed, so
 -- the expansion keys and root order of every root are re-keyed independently of

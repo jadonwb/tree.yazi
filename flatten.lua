@@ -223,7 +223,7 @@ function M.sort_children(files, pref)
 			local pb = random_key(seed or 0, tostring(b.url))
 			if pa ~= pb then
 				if reverse then
-					ord = pa > pb and 1 or -1
+					ord = pa > pb and -1 or 1
 				else
 					ord = pa < pb and -1 or 1
 				end
@@ -234,7 +234,7 @@ function M.sort_children(files, pref)
 			local pa, pb = primary(a), primary(b)
 			if pa ~= pb then
 				if reverse then
-					ord = pa > pb and 1 or -1
+					ord = pa > pb and -1 or 1
 				else
 					ord = pa < pb and -1 or 1
 				end

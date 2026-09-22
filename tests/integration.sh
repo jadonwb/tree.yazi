@@ -98,6 +98,7 @@ SCENARIOS=(
 	sort_live_natural
 	sort_live_random
 	sort_live_translit
+	sort_live_reverse
 	cross_tab_remove_prunes_saved
 	cross_tab_rename_rekeys_saved
 	cross_tab_move_prunes_saved

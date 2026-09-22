@@ -525,6 +525,58 @@ TOML
 	stop_session
 }
 
+# Reverse is honoured for every `by`, not just `natural`: a `sort alphabetical
+# --reverse=yes` request must flip both nested children and depth-0 roots while
+# `dir_first` keeps directories ahead (stock's `promote!` runs before the
+# comparator consults `reverse`). A scenario-local keymap issues the request
+# through the real key-sort preflight instead of relying on stock `,A`/`,a`.
+scenario_sort_live_reverse() {
+	new_env sort_live_reverse
+	write_config true adopt
+	make_fixture_sort_live
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "B"
+run = "sort alphabetical --reverse=yes"
+
+[[mgr.prepend_keymap]]
+on = "b"
+run = "sort alphabetical --reverse=no"
+TOML
+	launch "$FIXTURE"
+
+	# Expand alpha so its children are injected.
+	hovered_is 'alpha'
+	send_key l
+	settle 1.0
+	pane_has 'anew.txt'
+	pane_has 'zold.txt'
+
+	# Ascending baseline: anew before zold, zbig before zsmall, dir first.
+	line_before 'anew.txt' 'zold.txt'
+	line_before 'zbig.txt' 'zsmall.txt'
+	line_before 'alpha' 'zsmall.txt' "directory first before reverse"
+
+	# `B` requests alphabetical --reverse=yes: both levels flip.
+	send_key B
+	settle 1.0
+	log_has 'sort request captured; forcing by=none'
+	line_before 'zold.txt' 'anew.txt' "reverse reorders nested children"
+	line_before 'zsmall.txt' 'zbig.txt' "reverse reorders depth-0 roots"
+	line_before 'alpha' 'zsmall.txt' "dir_first is not reversed"
+
+	# `b` requests --reverse=no: the ascending order returns.
+	send_key b
+	settle 1.0
+	line_before 'anew.txt' 'zold.txt' "reverse=false restores ascending children"
+	line_before 'zbig.txt' 'zsmall.txt' "reverse=false restores ascending roots"
+
+	snapshot sort_live_reverse
+	assert_log_clean
+	stop_session
+}
+
 # Saved-state maintenance is not gated on the active tab's tree mode: a deletion
 # performed from a classic tab must still prune a tree tab's saved expansion, or
 # a directory recreated at the same URL would resurrect it.

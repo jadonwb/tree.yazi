@@ -31,42 +31,40 @@ local roots
 
 local layout
 
--- main.lua keeps the reconcile/seed/strip orchestration and all M bookkeeping.
 local rows
 
 -- Startup defaults for newly observed tabs; mode state lives per tab in M.tabs
 -- (no bare global flag).
 local startup_defaults = { tree = false, preview = true }
 
--- Dialog geometry/titles for the plugin-owned inputs and confirms. Stock Yazi
--- reads these from yazi.toml's [input]/[confirm] sections, which a plugin cannot
--- see, so the defaults reproduce stock's values and setup()'s `dialogs` option
--- can override each one.
+-- Defaults mirror stock's [input]/[confirm] values; setup()'s `dialogs` option
+-- overrides per field.
 local DIALOG_DEFAULTS = {
-	input_width = 80,
+	create_pos = { "top-center", y = 2, w = 80 },
+	rename_pos = { "hovered", y = 1, w = 80 },
+	filter_pos = { "top-center", y = 2, w = 80 },
+	overwrite_pos = { "center", w = 50, h = 15 },
 	create_title = "Create:",
 	rename_title = "Rename:",
 	filter_title = "Filter:",
 	overwrite_title = "Overwrite file?",
 	overwrite_body = "Will overwrite the following file:",
-	overwrite_width = 50,
-	overwrite_height = 15,
 }
 
 local dialogs = {
-	input_width = DIALOG_DEFAULTS.input_width,
+	create_pos = DIALOG_DEFAULTS.create_pos,
+	rename_pos = DIALOG_DEFAULTS.rename_pos,
+	filter_pos = DIALOG_DEFAULTS.filter_pos,
+	overwrite_pos = DIALOG_DEFAULTS.overwrite_pos,
 	create_title = DIALOG_DEFAULTS.create_title,
 	rename_title = DIALOG_DEFAULTS.rename_title,
 	filter_title = DIALOG_DEFAULTS.filter_title,
 	overwrite_title = DIALOG_DEFAULTS.overwrite_title,
 	overwrite_body = DIALOG_DEFAULTS.overwrite_body,
-	overwrite_width = DIALOG_DEFAULTS.overwrite_width,
-	overwrite_height = DIALOG_DEFAULTS.overwrite_height,
 }
 
--- Per-field override: a field of the right type wins, an omitted or
--- wrong-typed field falls back to the default, so a partial or malformed
--- `dialogs` table never breaks a dialog (same defensive style as glyphs).
+-- Per-field: a right-typed value wins; omitted or wrong-typed falls back to the
+-- default.
 local function resolve_dialogs(overrides)
 	local pick = {}
 	for name, default in pairs(DIALOG_DEFAULTS) do
@@ -87,13 +85,9 @@ local function tab_state(id)
 	return M.tabs[id or M.active_tab]
 end
 
--- Native provider View (any provider registered with `kind = "view"`: fd, rg,
--- vcs, or a custom one). Yazi cds the tab to a provider URL and streams provider
--- results as the Folder, so every tree path (renderer, actions, events) must
--- delegate to stock behavior there: the provider rows, stock `f` filtering, and
--- stock EscapeView (which cds back to the physical root) all stay untouched.
--- Recognized from the URL spec's `is_view` flag, not a scheme prefix, so custom
--- providers are handled too.
+-- Native provider View: Yazi cds into a provider URL and streams results as the
+-- Folder; detected via spec.is_view (not a scheme prefix), so custom providers
+-- match too.
 local function url_is_view(url)
 	return url ~= nil and url.spec ~= nil and url.spec.is_view == true
 end
@@ -102,11 +96,8 @@ local function native_search_view()
 	return url_is_view(cx.active.current.cwd)
 end
 
--- Renderer/header/action routing authority. Before any lifecycle handler has
--- observed a tab (the very first frame of a startup launch) fall back to the
--- configured startup default so the first paint is already tree-shaped. A
--- native search View is never a tree View, regardless of the tab's recorded
--- mode, so it delegates to stock Yazi everywhere.
+-- Renderer/header/action routing authority; before the first lifecycle event
+-- fall back to the startup default so the first frame is already tree-shaped.
 local function active_tree()
 	if native_search_view() then
 		return false
@@ -139,13 +130,9 @@ M.hidden_roots = {} -- topmost hidden URLs skipped while show_hidden is false
 M.poller = nil -- ya.async Handle of the active external-change poll loop
 M.poller_token = nil -- identity of the loop M.poller currently refers to
 
--- Per-tab / per-root persistence. M.expanded/M.rows/M.root_order/M.filter_query
--- stay the live state for the active tab, while M.tabs holds the state that must
--- survive a tab switch: the tab's tree/preview modes, its sort/native-filter
--- handoff, its last-seen root, and its per-root expansion/order/tree-filter map.
--- Yazi restores a whole cached Folder (with the plugin's injected rows) on cd,
--- and `update_files` always targets the active tab, so the plugin must save the
--- outgoing tab itself and reconcile the incoming one against its saved set.
+-- M.expanded/M.rows/M.root_order/M.filter_query are the live active-tab state;
+-- M.tabs[id] saves the modes, sort/filter handoff, last root, and per-root
+-- expansion/order/filter map across a switch.
 M.active_tab = nil -- numeric id of the tab M.expanded/M.rows describe
 M.tabs = {} -- [tab_id] = { tree, preview, sort_saved, suspended_filter, random_seed, root, roots }; replay stash on M is tab-gated (inject_snapshot/inject_cwd/inject_tab)
 -- roots[root_url] = { expanded=set, order=list|nil, filter=string|nil }
@@ -1015,15 +1002,9 @@ local function stop_poller()
 	ya.dbg("[tree-dbg] poll stop")
 end
 
--- r: tree-aware rename. Outside tree mode, for a depth-0 row, with a native
--- multi-selection, or during an active visual range this delegates to stock
--- rename, forwarding the stock binding's `cursor = "before_ext"`. An in-progress
--- visual range is not yet in `cx.active.selected` (stock's Rename actor runs
--- `escape_visual` itself), so it is detected through `cx.active.mode`. A single
--- injected descendant at any depth is renamed beside its parent without stock
--- `reveal` rerooting the tab; its caret reproduces `before_ext` by opening a
--- realtime input and emitting the input layer's own `move` offset. Casefold
--- handling remains the only stock capability the plugin-owned path cannot run.
+-- r: delegate to stock rename outside tree mode, for depth-0 rows, with a
+-- multi-selection, or during a visual range; an injected descendant is renamed
+-- in place (input:move reproduces before_ext) without reveal rerooting.
 function M:rename()
 	if not active_tree() then
 		ya.emit("rename", { cursor = "before_ext" })
@@ -1196,14 +1177,8 @@ function M:root_down()
 	end
 end
 
--- t t: in tree mode a new tab always opens at the tree cwd, ignoring the hover.
--- Stock `tab_create --current` passes target=None, so Yazi's TabCreate actor
--- reveals the hovered URL; for a plugin-injected descendant that cds to the
--- descendant's parent (for example `flavors` for `flavors/arrowlake-light.yazi`)
--- instead of the tree root. Emitting the cwd as an explicit target takes the
--- actor's target branch and never consults the hover. Outside tree mode (and in
--- native provider Views, where active_tree() is false) this re-emits the stock
--- smart-tab behavior unchanged.
+-- Tree mode: emit the cwd as an explicit target so tab_create ignores the
+-- hover; outside, re-emit stock tab_create --current.
 function M:tab_create(args)
 	args = args or {}
 	if not active_tree() then
@@ -1280,12 +1255,8 @@ function M:create(args)
 	end)
 end
 
--- A: bulk create at the hovered tree level. Outside tree mode, with no hover,
--- or when the resolved destination is the tree root, delegate to stock
--- bulk_create (which joins every typed path to the cwd, exactly what is wanted
--- there). Otherwise the destination is the hovered directory, or the hovered
--- file's own directory, and every path typed in the user's text editor is
--- created under it without changing cwd.
+-- A: bulk create under the hovered directory (or file's parent) without
+-- changing cwd; a cwd destination delegates to stock.
 function M:bulk_create(args)
 	if not active_tree() then
 		ya.emit("bulk_create", {})
@@ -1325,11 +1296,8 @@ function M:bulk_create(args)
 	end)
 end
 
--- p / P: paste into the hovered tree level. A cwd destination (root-level file,
--- or no hover) delegates to stock paste for exact parity; otherwise every
--- yanked source is spawned as one native copy/move task. Cut clears the yank
--- set and drops exactly the moved URLs from the active selection, leaving
--- unrelated selected entries intact.
+-- p/P: paste into the hovered tree level (one native task per yanked source;
+-- cut clears the yank set); a cwd destination delegates to stock.
 function M:paste(args)
 	args = args or {}
 	local force = args.force == true
@@ -1507,7 +1475,7 @@ function M:filter()
 			-- Top-center input at stock's width/title so the popup matches the
 			-- native filter (stock's filter popup is 80 wide); omitting `pos`
 			-- leaves the popup zero-width and invisible.
-			pos = { "top-center", y = 2, w = dialogs.input_width },
+			pos = dialogs.filter_pos,
 			realtime = true,
 			debounce = 0.05,
 		})
@@ -1789,7 +1757,6 @@ end
 function M:setup(opts)
 	opts = opts or {}
 
-	-- Resolve the dialog geometry/titles before any action can open a popup.
 	dialogs = resolve_dialogs(type(opts.dialogs) == "table" and opts.dialogs or {})
 
 	-- Resolve and bind the layout/ratio + sort-handoff module first: setup
@@ -1797,7 +1764,6 @@ function M:setup(opts)
 	-- accessor must exist before any layout.* call below.
 	if not layout then
 		require(".layout") -- runs in init.lua's async context
-		-- bind() installs the live-tab accessor.
 		layout = package.loaded["tree.layout"]
 	end
 	layout.bind({
@@ -1812,20 +1778,17 @@ function M:setup(opts)
 
 	if not render then
 		require(".render") -- runs in init.lua's async context
-		-- plain sync functions.
 		render = package.loaded["tree.render"]
 	end
 	render.configure(opts)
 
 	if not poller then
 		require(".poller") -- runs in init.lua's async context
-		-- start() binds the sync bridges.
 		poller = package.loaded["tree.poller"]
 	end
 
 	if not roots then
 		require(".roots") -- runs in init.lua's async context
-		-- bind() installs the live-state accessor.
 		roots = package.loaded["tree.roots"]
 	end
 	roots.bind({
@@ -1863,7 +1826,6 @@ function M:setup(opts)
 
 	if not rows then
 		require(".rows") -- runs in init.lua's async context
-		-- plain sync helpers that read cx directly.
 		rows = package.loaded["tree.rows"]
 	end
 
@@ -1915,7 +1877,6 @@ function M:setup(opts)
 	-- main.lua does the M access.
 	if not events then
 		require(".events") -- runs in init.lua's async context
-		-- Raw module table: plain sync handlers, no per-event require proxy.
 		events = package.loaded["tree.events"]
 	end
 	local mutation = events.bind({

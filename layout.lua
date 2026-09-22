@@ -107,13 +107,10 @@ local function copy_sort(s)
 	return o
 end
 
--- Pin the active tree tab's folder ordering to `none` while injected hierarchy
--- is live, so the built-in sorter cannot interleave children among the root
--- entries. The configured sort is captured on the tab itself. The live
--- preference is re-checked on every call: a tab created with an explicit target
--- starts from the configured sort rather than the creator's pinned `none`, so
--- acting on sort_saved alone would leave that tab's live sorter reordering the
--- injected rows.
+-- Pin the tree tab's folder ordering to none so the built-in sorter cannot
+-- interleave injected children; capture the configured sort on the tab, and
+-- re-check the live preference because a tab created with an explicit target
+-- starts from the configured sort, not the pinned none.
 local function pin_sort_for(t)
 	if not t then
 		return

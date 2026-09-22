@@ -153,13 +153,23 @@ component's `layout` and `_chunks` fields are left untouched.
 - **Collisions are handled differently by `plugin tree create` and
   `plugin tree bulk_create`.** Target-aware create overwrites an existing
   regular file in place with `fs.write` (and unlinks an existing symlink,
-  because `fs.write` would otherwise follow the link and truncate its target),
-  while bulk create binds file entries to `create_new` (`O_CREAT|O_EXCL`), so an
-  existing _file_ is reported as a failure and left untouched, while an existing
-  _directory_ entry is silently accepted (`create_dir_all` succeeds and is
-  counted as created). The two actions diverge because single create is the
-  target-aware replacement path, while bulk create mirrors stock's per-file
-  `create_new` semantics.
+  because `fs.write` would otherwise follow the link and truncate its target);
+  any other existing path prompts before replacement, and a directory cannot be
+  replaced by a file, so confirming a directory collision reports the write
+  error and leaves the directory intact — matching stock, which prompts for any
+  existing path. Bulk create binds file entries to `create_new`
+  (`O_CREAT|O_EXCL`), so an existing _file_ is reported as a failure and left
+  untouched, while an existing _directory_ entry is silently accepted
+  (`create_dir_all` succeeds and is counted as created). The two actions diverge
+  because single create is the target-aware replacement path, while bulk create
+  mirrors stock's per-file `create_new` semantics.
+- **On a case-insensitive filesystem**: a rename that only changes the case asks
+  before overwriting; stock Yazi just renames it, the plugin cannot perform
+  Yazi's same-file check.
+- **Bulk create picks the text opener by file type, not name.** Yazi matches
+  `[open]` rules against a temporary file named `bulk-create.txt`, so a rule
+  keyed to that name can match. The plugin matches only the `text/plain` type,
+  so a name-based rule for `bulk-create.txt` is ignored.
 
 ## Architecture
 
@@ -439,29 +449,31 @@ require("tree"):setup({
 	--   preview true  (default) preview pane on
 	startup = { tree = false, preview = true },
 
-	-- Geometry/titles for the plugin-owned dialogs, defaulting to stock Yazi's
-	-- [input]/[confirm] values (which a plugin cannot read). This covers the
-	-- create/rename/filter inputs and the create/rename overwrite confirms; the
-	-- bulk-create "Continue to create?" confirm is still hardcoded and not
-	-- covered, and `create_title` is a single string, so stock's "Create (dir):"
-	-- directory variant is not reproduced. A missing key or a wrong-typed value
-	-- falls back to its default.
+	-- Position/titles for the plugin-owned dialogs, defaulting to stock Yazi's
+	-- [input]/[confirm] values. A plugin has no native Lua binding for
+	-- yazi.toml's [input]/[confirm] sections, so it cannot read them and the
+	-- overrides live here. This covers the create/rename/filter inputs and the
+	-- create/rename overwrite confirms; the bulk-create "Continue to create?"
+	-- confirm is still hardcoded and not covered, and `create_title` is a single
+	-- string, so stock's "Create (dir):" directory variant is not reproduced. A
+	-- missing key or a wrong-typed value falls back to its default.
 	dialogs = {
-		input_width = 80,
+		create_pos = { "top-center", y = 2, w = 80 },
+		rename_pos = { "hovered", y = 1, w = 80 },
+		filter_pos = { "top-center", y = 2, w = 80 },
+		overwrite_pos = { "center", w = 50, h = 15 },
 		create_title = "Create:",
 		rename_title = "Rename:",
 		filter_title = "Filter:",
 		overwrite_title = "Overwrite file?",
 		overwrite_body = "Will overwrite the following file:",
-		overwrite_width = 50,
-		overwrite_height = 15,
 	},
 })
 ```
 
-The overwrite confirms match stock's title, body, and geometry. Stock also
+The overwrite confirms match stock's title, body, and position. Stock also
 renders an icon+URL file list in that confirm, but `ya.confirm` discards its
-`list` field, so a plugin cannot reproduce the list; title/geometry/body is the
+`list` field, so a plugin cannot reproduce the list; title/position/body is the
 maximum parity available. `dialogs` covers only the create/rename/filter inputs
 and those overwrite confirms: the bulk-create "Continue to create?" confirm is
 hardcoded and not covered, and `create_title` is a single string, so stock's

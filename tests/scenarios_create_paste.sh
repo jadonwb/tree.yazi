@@ -141,9 +141,9 @@ scenario_create_overwrite() {
 	stop_session
 }
 
-# Create collisions: an existing directory is a clean failure (no prompt, no
-# EISDIR error, no trash), and an existing symlink is replaced as a link without
-# touching its target.
+# Create collisions: an existing directory prompts like stock (declining leaves
+# it untouched; confirming surfaces the write failure and still leaves it), and
+# an existing symlink is replaced as a link without touching its target.
 scenario_create_collisions() {
 	new_env create_collisions
 	write_config true adopt
@@ -164,17 +164,37 @@ scenario_create_collisions() {
 	settle 0.3
 	hovered_is 'existing.txt'
 
-	# Directory collision: no overwrite prompt, a clear error, disk untouched.
+	# Directory collision, declined: stock prompts for any existing path, and
+	# declining leaves the directory and its contents untouched.
 	send_key a
 	settle 0.6
 	pane_has 'Create:'
 	send_text 'adir'
 	settle 0.3
 	send_key Enter
-	settle 1.2
-	pane_lacks 'Overwrite file?' "directory collision must not prompt"
-	pane_has 'already exists as a directory' "clear error notification"
-	log_has 'create dir collision'
+	settle 0.8
+	pane_has 'Overwrite file?' "directory collision must prompt like stock"
+	send_key n
+	settle 1.0
+	log_has 'create overwrite declined'
+	[ -d "$FIXTURE/alpha/adir" ] || fail "declining must leave the directory"
+	file_content_is "$FIXTURE/alpha/adir/inside.txt" 'DIRKEEP'
+	log_lacks '[Tt]rash'
+
+	# Directory collision, confirmed: the write fails on the directory, which is
+	# reported, and the directory and its contents stay intact.
+	send_key a
+	settle 0.6
+	pane_has 'Create:'
+	send_text 'adir'
+	settle 0.3
+	send_key Enter
+	settle 0.8
+	pane_has 'Overwrite file?' "directory collision must prompt when confirmed"
+	send_key y
+	settle 1.4
+	pane_has 'Create failed' "confirming a directory collision reports the write error"
+	log_has 'create write failed'
 	[ -d "$FIXTURE/alpha/adir" ] || fail "directory collision must leave the directory"
 	file_content_is "$FIXTURE/alpha/adir/inside.txt" 'DIRKEEP'
 	log_lacks '[Tt]rash'

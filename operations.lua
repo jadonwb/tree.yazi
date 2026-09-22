@@ -17,8 +17,6 @@ function M.nested_rename(ctx)
 	local old_url = Url(old_url_str)
 	local parent = old_url.parent
 
-	-- Dialog geometry/titles resolved by main.lua from setup()'s `dialogs`
-	-- option; the fallbacks keep stock values if a caller omits them.
 	local dialogs = ctx.dialogs or {}
 	local old_stat = fs.stat(old_url, false)
 
@@ -31,7 +29,7 @@ function M.nested_rename(ctx)
 		title = dialogs.rename_title or "Rename:",
 		history = "shared",
 		value = name,
-		pos = { "hovered", y = 1, w = dialogs.input_width or 80 },
+		pos = dialogs.rename_pos,
 		realtime = true,
 	})
 	if move then
@@ -61,14 +59,11 @@ function M.nested_rename(ctx)
 		return
 	end
 
-	-- Ask before replacing an existing sibling. The plugin cannot run the
-	-- casefold engine, so the exact same-path check above is the only
-	-- implicit no-op; every other existing destination prompts.
 	local stat = fs.stat(new_url, false)
 	if stat then
 		ya.dbg("[tree-dbg] nested rename overwrite prompt; new=", new_url_str)
 		local ok = ya.confirm({
-			pos = { "center", w = dialogs.overwrite_width or 50, h = dialogs.overwrite_height or 15 },
+			pos = dialogs.overwrite_pos,
 			title = dialogs.overwrite_title or "Overwrite file?",
 			body = dialogs.overwrite_body or "Will overwrite the following file:",
 		})
@@ -94,11 +89,10 @@ function M.nested_rename(ctx)
 	apply_nested_rename(old_url_str, new_url_str)
 end
 
--- Create one file or directory under the captured target without changing cwd.
--- A trailing separator selects directory creation; an existing file asks before
--- being replaced; creating a file where a directory exists is a clean error (an
--- existing directory is accepted when a directory was requested). Completion
--- goes through ctx.create_after so the injected hierarchy is rebuilt in place.
+-- Create under the captured target without changing cwd; a trailing separator
+-- means directory. Any existing path prompts before replacement unless forced;
+-- a directory cannot be replaced, so confirming surfaces the write error
+-- (matching stock).
 function M.create(ctx)
 	local force = ctx.force
 	local target_str = ctx.target_str
@@ -111,7 +105,7 @@ function M.create(ctx)
 		name = "create-file",
 		title = dialogs.create_title or "Create:",
 		history = "shared",
-		pos = { "top-center", y = 2, w = dialogs.input_width or 80 },
+		pos = dialogs.create_pos,
 	})
 	if event ~= 1 or value == nil or value == "" then
 		ya.dbg("[tree-dbg] create cancelled; event=", tostring(event))
@@ -144,22 +138,10 @@ function M.create(ctx)
 			fs.create("dir_all", parent)
 		end
 		local stat = fs.stat(joined, false)
-		if stat and stat.is_dir then
-			-- A directory can never be replaced by an empty file; fail
-			-- cleanly instead of prompting and then hitting EISDIR.
-			ya.dbg("[tree-dbg] create dir collision; url=", joined_str)
-			ya.notify({
-				title = "Create failed",
-				content = "`" .. joined_str .. "` already exists as a directory",
-				level = "error",
-				timeout = 3,
-			})
-			return
-		end
 		if stat then
 			if not force then
 				local ok = ya.confirm({
-					pos = { "center", w = dialogs.overwrite_width or 50, h = dialogs.overwrite_height or 15 },
+					pos = dialogs.overwrite_pos,
 					title = dialogs.overwrite_title or "Overwrite file?",
 					body = dialogs.overwrite_body or "Will overwrite the following file:",
 				})
@@ -213,11 +195,8 @@ local function parse_entries(content)
 	return entries
 end
 
--- Stock BulkCreate::opener: match the first [open] rule for a "text/plain"
--- dummy, then walk that rule's `use` names in order and take the first blocking
--- opener. Lua cannot construct stock's synthetic `bulk-create.txt` File, so the
--- match is mime-only here; a url-based [open] rule keyed to that dummy name is
--- not selected (the one divergence from stock).
+-- Stock BulkCreate::opener: first text/plain [open] rule, then the first
+-- blocking opener in its use list.
 local function text_opener_run()
 	for _, rule in pairs(rt.open.rules:match({ mime = "text/plain" })) do
 		for _, name in ipairs(rule.use) do
@@ -235,12 +214,10 @@ local function text_opener_run()
 	return nil
 end
 
--- Stock Splatter for a single file, with ya.quote reproducing its platform
--- quoting. A local temp file's content path and url are equal, so %s/%s1 and
--- %S/%S1 are the file and %d/%d1 and %D/%D1 its parent; higher indices are
--- empty, %h/%H and %y*/%Y* are empty, %t/%T consume the next token (a tab shift
--- selects nothing from a one-file source), %% is a literal %, and any other
--- %X stays a literal %X.
+-- Stock Splatter for one file (ya.quote mirrors its platform quoting): a local
+-- temp file's content path and url are equal, so %s is the file and %d its
+-- parent (index 1 the same); %h/%y/%t shifts are empty; unknown %X stays
+-- literal.
 local function splat_single(template, path, parent)
 	local quoted_path = ya.quote(path)
 	local quoted_parent = ya.quote(parent)
@@ -313,8 +290,7 @@ local function splat_single(template, path, parent)
 	return table.concat(out)
 end
 
--- Bulk create under the captured target without changing cwd. File entries use
--- create_new, so an existing path is never overwritten.
+-- Bulk create under the captured target without changing cwd.
 function M.bulk_create(ctx)
 	local target_str = ctx.target_str
 	local cwd_str = ctx.cwd_str

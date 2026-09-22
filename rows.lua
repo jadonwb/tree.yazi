@@ -98,10 +98,8 @@ local function rehydrate_rows()
 	return rows
 end
 
--- Locale-independent byte comparison: the first differing byte decides, and a
--- proper prefix sorts first (Lua's native `<` compiles to `strcoll`). A local
--- copy keeps this sync-safe: a plugin-local `require` may yield, and
--- seed_root_order can run outside a coroutine.
+-- Local copy (a plugin-local require may yield, and seed_root_order can run
+-- outside a coroutine); locale-independent byte compare, proper prefix first.
 local function bytes_lt(a, b)
 	local la, lb = #a, #b
 	local n = la < lb and la or lb
@@ -130,8 +128,6 @@ local function seed_root_order()
 	if #files == 0 then
 		return nil
 	end
-	-- Byte comparison, not Lua `<` (strcoll/locale-sensitive), so the seeded
-	-- order matches the emulated sort regardless of the process collation.
 	table.sort(files, function(a, b)
 		local ad = a.stat and a.stat.is_dir and true or false
 		local bd = b.stat and b.stat.is_dir and true or false

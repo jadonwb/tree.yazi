@@ -150,7 +150,6 @@ local function bytes_le(a, b)
 	return not bytes_lt(b, a)
 end
 
--- -1/0/1 byte-order comparison of two strings.
 local function bytes_cmp(a, b)
 	if bytes_lt(a, b) then
 		return -1
@@ -174,15 +173,10 @@ local function ascii_lower(s)
 	return table.concat(out)
 end
 
--- Directories first, then the tab's captured sort preference. `pref` is a
--- copied SortForm (or nil); every unsupported `by` (nil, none, custom) falls
--- back to alphabetical. `dir_first` defaults to true and is never reversed. A
--- tie on the primary key is resolved by `pref.fallback` (natural, or raw
--- basename bytes for anything else). `natural` transliterates before comparing
--- when `pref.translit` is true; `random` orders by a frozen per-tab seed. Every
--- string key and tie-break compares encoded bytes, so the order is independent
--- of the process locale, like stock Yazi. A final url comparison keeps the
--- order deterministic.
+-- pref is the tab's copied SortForm (or nil); unsupported by (nil/none/custom)
+-- becomes alphabetical, dir_first defaults true and is never reversed, a primary
+-- tie is broken by fallback (natural or basename bytes), and a final url compare
+-- keeps the order deterministic.
 function M.sort_children(files, pref)
 	local by = pref and pref.by
 	if

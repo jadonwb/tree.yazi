@@ -5,7 +5,7 @@ local M = {}
 -- Bound once by main.lua; every stateful helper below reads the live tab record
 -- and preferences through these closures.
 --   tab_state(id) -> the live tab record for `id` (or the active tab), or nil
---   native_search() -> true when the active Folder is a native fd/rg View
+--   native_search() -> true when the active Folder is a native provider View
 --   pref() -> the live cx.active.pref (read fresh on every call, never
 --             snapshotted: pin_sort_for re-reads it per call)
 local L

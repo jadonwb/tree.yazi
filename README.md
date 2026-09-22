@@ -128,26 +128,36 @@ component's `layout` and `_chunks` fields are left untouched.
   variant-aware preflight. The generic relay preflight sees the op, but Lua
   cannot identify it as Full, and the Lua `FilesOp` exposes no variant, so Lua
   cannot substitute one.
+- **A root-level paste can appear at the bottom before re-sorting.** When the
+  destination is the tree cwd, paste delegates to stock and the native
+  `Upserting` hits the active folder; with the native sorter pinned to `none`
+  the entry is appended and painted, and only the later `duplicate`/`move` event
+  rebuilds it into place (bounded by the DDS pump's batching, up to about half a
+  second). A nested destination does not flash because its upsert is not
+  addressed to the visible folder. There is no pre-paint hook for this: `paste`
+  is not preflightable and the relay `update_files` op cannot be identified or
+  substituted from Lua.
 - **Custom sort falls back to alphabetical.** While tree mode pins the tab's
   folder sort to `none` the captured sort is applied per directory, but
-  `by = "custom"` falls back to alphabetical because the custom rank map is not
-  exposed to Lua at all, and even with it the ranks are keyed by basename on a
-  single folder, so injected descendants from different subdirectories would
-  collide. A `size` sort compares the entry's own `stat.len` and does not
-  recurse into directories, because Yazi's recursive directory sizes arrive
-  through a separate `Size` op that injected rows never receive. The `extension`
-  key also differs: the plugin splits on the last dot, so a dotfile with no
-  other dot (`.bashrc`) gets extension `bashrc`, while Yazi returns no extension
-  because it uses Rust's `Path::extension`, which treats a leading-dot-only name
-  as extensionless; the Lua port has only a last-dot split.
+  `by = "custom"` falls back to alphabetical (bytewise, not locale collation)
+  because the custom rank map is not exposed to Lua at all, and even with it the
+  ranks are keyed by basename on a single folder, so injected descendants from
+  different subdirectories would collide. A `size` sort compares the entry's own
+  `stat.len` and does not recurse into directories, because Yazi's recursive
+  directory sizes arrive through a separate `Size` op that injected rows never
+  receive. The `extension` key also differs: the plugin splits on the last dot,
+  so a dotfile with no other dot (`.bashrc`) gets extension `bashrc`, while Yazi
+  returns no extension because it uses Rust's `Path::extension`, which treats a
+  leading-dot-only name as extensionless; the Lua port has only a last-dot
+  split.
 - **Collisions are handled differently by `plugin tree create` and
   `plugin tree bulk_create`.** Target-aware create overwrites an existing
   regular file in place with `fs.write` (and unlinks an existing symlink,
   because `fs.write` would otherwise follow the link and truncate its target),
-  while bulk create binds file entries to `create_new` (`O_CREAT|O_EXCL`), so
-  an existing _file_ is reported as a failure and left untouched, while an
-  existing _directory_ entry is silently accepted (`create_dir_all` succeeds and
-  is counted as created). The two actions diverge because single create is the
+  while bulk create binds file entries to `create_new` (`O_CREAT|O_EXCL`), so an
+  existing _file_ is reported as a failure and left untouched, while an existing
+  _directory_ entry is silently accepted (`create_dir_all` succeeds and is
+  counted as created). The two actions diverge because single create is the
   target-aware replacement path, while bulk create mirrors stock's per-file
   `create_new` semantics.
 
@@ -186,9 +196,10 @@ hold `M`:
 - `render.lua`: the row-rendering primitives, connector configuration, private
   render style, and resolved glyph state.
 - `flatten.lua`: directory-first ordering, smart-case literal matching, a Lua
-  port of Yazi's natural sort, and a separate deterministic FNV-1a `(seed, url)`
-  comparator that emulates random order (Yazi's own `SortBy::Random` draws from
-  a fresh `SmallRng` per sort).
+  port of Yazi's natural sort, locale-independent bytewise string comparison
+  with ASCII-only case folding, and a separate deterministic FNV-1a
+  `(seed, url)` comparator that emulates random order (Yazi's own
+  `SortBy::Random` draws from a fresh `SmallRng` per sort).
 - `translit.lua`: the lazily loaded port of Yazi's translit table, used only for
   natural sort with `translit` true.
 - `poller.lua`: the setup-installed external-change loop whose bounded per-tick
@@ -238,14 +249,16 @@ query is parked per tab in `t.suspended_filter`. Poll sessions carry an identity
 (`poll_token`/`M.poller_token`): a newer session makes an older loop drop its
 tick, and abort/finish clears the snapshot.
 
-### Native fd/rg search views
+### Native provider views
 
-`active_tree()` returns false for a native `fd://`/`rg://` provider View
-regardless of the tab's recorded mode, so provider rows, stock rendering, stock
-actions, and the stock rebuild all delegate untouched. The mode is still
-recorded on the tab, and sort pin/restore is deferred to the next physical `cd`;
-stock EscapeView (which cds back to the physical root) runs untouched, and the
-poll loop stops for the provider View and starts again on a physical tree.
+`active_tree()` returns false for any native provider View — any URL whose spec
+has `is_view` set, i.e. any provider registered with `kind = "view"` (`fd://`,
+`rg://`, `vcs://`, or a custom one) — regardless of the tab's recorded mode, so
+provider rows, stock rendering, stock actions, and the stock rebuild all
+delegate untouched. The mode is still recorded on the tab, and sort pin/restore
+is deferred to the next physical `cd`; stock EscapeView (which cds back to the
+physical root) runs untouched, and the poll loop stops for the provider View and
+starts again on a physical tree.
 
 ## Interoperability
 
@@ -393,7 +406,7 @@ actions or plugins.
 ## Configuration
 
 Call `setup()` once in your `~/.config/yazi/init.lua`. It accepts a single table
-with four optional keys; every key is independent, and omitting the table (or a
+with five optional keys; every key is independent, and omitting the table (or a
 key) keeps the documented default. All `setup()` options are listed here.
 
 ```lua
@@ -425,8 +438,34 @@ require("tree"):setup({
 	--   tree    false (default) tree mode off
 	--   preview true  (default) preview pane on
 	startup = { tree = false, preview = true },
+
+	-- Geometry/titles for the plugin-owned dialogs, defaulting to stock Yazi's
+	-- [input]/[confirm] values (which a plugin cannot read). This covers the
+	-- create/rename/filter inputs and the create/rename overwrite confirms; the
+	-- bulk-create "Continue to create?" confirm is still hardcoded and not
+	-- covered, and `create_title` is a single string, so stock's "Create (dir):"
+	-- directory variant is not reproduced. A missing key or a wrong-typed value
+	-- falls back to its default.
+	dialogs = {
+		input_width = 80,
+		create_title = "Create:",
+		rename_title = "Rename:",
+		filter_title = "Filter:",
+		overwrite_title = "Overwrite file?",
+		overwrite_body = "Will overwrite the following file:",
+		overwrite_width = 50,
+		overwrite_height = 15,
+	},
 })
 ```
+
+The overwrite confirms match stock's title, body, and geometry. Stock also
+renders an icon+URL file list in that confirm, but `ya.confirm` discards its
+`list` field, so a plugin cannot reproduce the list; title/geometry/body is the
+maximum parity available. `dialogs` covers only the create/rename/filter inputs
+and those overwrite confirms: the bulk-create "Continue to create?" confirm is
+hardcoded and not covered, and `create_title` is a single string, so stock's
+"Create (dir):" directory variant is not reproduced.
 
 ## Diagnostics
 

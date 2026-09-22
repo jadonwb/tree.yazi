@@ -67,7 +67,9 @@ SCENARIOS=(
 	create_collisions
 	bulk_create
 	bulk_create_collision
+	bulk_create_opener
 	paste
+	paste_order
 	cut_paste
 	cut_paste_keeps_selection
 	remove_trash

@@ -418,18 +418,49 @@ SH
 	chmod +x "$DIR/editor.sh"
 }
 
+# Shared marker-editor primitive: write an executable script at <script-path>
+# that copies a caller-provided $DIR/bulk_input verbatim into its argument ($1)
+# and touches <marker-path>. The marker is what a scenario asserts to prove the
+# editor ran.
+make_marker_editor() {
+	local script="$1" marker="$2"
+	cat >"$script" <<SH
+#!/bin/sh
+cp "$DIR/bulk_input" "\$1"
+touch "$marker"
+exit 0
+SH
+	chmod +x "$script"
+}
+
+# Append a custom blocking text opener rule pointing at <script-path> to the
+# isolated yazi.toml, so configured-opener resolution can be proven independently
+# of $EDITOR (a user [opener] entry replaces the preset edit list).
+make_custom_text_opener() {
+	local script="$1"
+	cat >>"$CFG/yazi.toml" <<TOML
+
+[opener]
+edit = [{ run = "$script %s", block = true }]
+TOML
+}
+
 # Deterministic bulk-create editor: copies a caller-provided $DIR/bulk_input
 # verbatim into the editor's argument ($1) and touches $DIR/bulk_editor_ran.
 # The marker is what a scenario asserts to prove the editor ran, which is also
 # how a stock-delegation check observes that the stock bulk path was reached.
 make_bulk_create_editor() {
-	cat >"$DIR/bulk_editor.sh" <<SH
-#!/bin/sh
-cp "$DIR/bulk_input" "\$1"
-touch "$DIR/bulk_editor_ran"
-exit 0
-SH
-	chmod +x "$DIR/bulk_editor.sh"
+	make_marker_editor "$DIR/bulk_editor.sh" "$DIR/bulk_editor_ran"
+}
+
+# Install a custom blocking text opener so configured-opener resolution can be
+# proven independently of $EDITOR: write a distinct marker editor and append an
+# [opener] edit rule pointing at it to the isolated yazi.toml (a user entry
+# replaces the preset edit list). The editor copies a caller-provided
+# $DIR/bulk_input into its argument ($1) and touches $DIR/opener_editor_ran.
+make_text_opener_editor() {
+	make_marker_editor "$DIR/opener_editor.sh" "$DIR/opener_editor_ran"
+	make_custom_text_opener "$DIR/opener_editor.sh"
 }
 
 # ---------------------------------------------------------------------------

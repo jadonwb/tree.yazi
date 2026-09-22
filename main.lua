@@ -38,21 +38,68 @@ local rows
 -- (no bare global flag).
 local startup_defaults = { tree = false, preview = true }
 
+-- Dialog geometry/titles for the plugin-owned inputs and confirms. Stock Yazi
+-- reads these from yazi.toml's [input]/[confirm] sections, which a plugin cannot
+-- see, so the defaults reproduce stock's values and setup()'s `dialogs` option
+-- can override each one.
+local DIALOG_DEFAULTS = {
+	input_width = 80,
+	create_title = "Create:",
+	rename_title = "Rename:",
+	filter_title = "Filter:",
+	overwrite_title = "Overwrite file?",
+	overwrite_body = "Will overwrite the following file:",
+	overwrite_width = 50,
+	overwrite_height = 15,
+}
+
+local dialogs = {
+	input_width = DIALOG_DEFAULTS.input_width,
+	create_title = DIALOG_DEFAULTS.create_title,
+	rename_title = DIALOG_DEFAULTS.rename_title,
+	filter_title = DIALOG_DEFAULTS.filter_title,
+	overwrite_title = DIALOG_DEFAULTS.overwrite_title,
+	overwrite_body = DIALOG_DEFAULTS.overwrite_body,
+	overwrite_width = DIALOG_DEFAULTS.overwrite_width,
+	overwrite_height = DIALOG_DEFAULTS.overwrite_height,
+}
+
+-- Per-field override: a field of the right type wins, an omitted or
+-- wrong-typed field falls back to the default, so a partial or malformed
+-- `dialogs` table never breaks a dialog (same defensive style as glyphs).
+local function resolve_dialogs(overrides)
+	local pick = {}
+	for name, default in pairs(DIALOG_DEFAULTS) do
+		local value = overrides[name]
+		if type(value) == type(default) then
+			pick[name] = value
+		else
+			if value ~= nil then
+				ya.dbg("[tree-dbg] ignoring dialog override: ", name, " has the wrong type")
+			end
+			pick[name] = default
+		end
+	end
+	return pick
+end
+
 local function tab_state(id)
 	return M.tabs[id or M.active_tab]
 end
 
--- Native fd/rg provider View. Yazi cds the tab to a `fd://`/`rg://` URL and
--- streams provider results as the Folder, so every tree path (renderer, actions,
--- events) must delegate to stock behavior there: the provider rows, stock `f`
--- filtering, and stock EscapeView (which cds back to the physical root) all
--- stay untouched. Recognized purely from a cwd scheme.
-local function is_search_url(url_str)
-	return url_str:sub(1, 5) == "fd://" or url_str:sub(1, 5) == "rg://"
+-- Native provider View (any provider registered with `kind = "view"`: fd, rg,
+-- vcs, or a custom one). Yazi cds the tab to a provider URL and streams provider
+-- results as the Folder, so every tree path (renderer, actions, events) must
+-- delegate to stock behavior there: the provider rows, stock `f` filtering, and
+-- stock EscapeView (which cds back to the physical root) all stay untouched.
+-- Recognized from the URL spec's `is_view` flag, not a scheme prefix, so custom
+-- providers are handled too.
+local function url_is_view(url)
+	return url ~= nil and url.spec ~= nil and url.spec.is_view == true
 end
 
 local function native_search_view()
-	return is_search_url(tostring(cx.active.current.cwd))
+	return url_is_view(cx.active.current.cwd)
 end
 
 -- Renderer/header/action routing authority. Before any lifecycle handler has
@@ -743,7 +790,7 @@ local poll_token = 0
 
 -- Snapshot the active tree session for one tick. Runs in the sync context (with
 -- M/cx access). Returns nil when tree mode no longer applies to the active view
--- (tree off, classic tab, or a native fd/rg provider View) or when this loop has
+-- (tree off, classic tab, or a native provider View) or when this loop has
 -- been superseded, which makes the caller stop.
 local poll_scope = ya.sync(function(_, token)
 	if token ~= poll_token or not active_tree() then
@@ -1019,6 +1066,7 @@ function M:rename()
 			name = name,
 			move = move,
 			apply_nested_rename = apply_nested_rename,
+			dialogs = dialogs,
 		})
 	end)
 end
@@ -1154,7 +1202,7 @@ end
 -- descendant's parent (for example `flavors` for `flavors/arrowlake-light.yazi`)
 -- instead of the tree root. Emitting the cwd as an explicit target takes the
 -- actor's target branch and never consults the hover. Outside tree mode (and in
--- native fd/rg Views, where active_tree() is false) this re-emits the stock
+-- native provider Views, where active_tree() is false) this re-emits the stock
 -- smart-tab behavior unchanged.
 function M:tab_create(args)
 	args = args or {}
@@ -1227,6 +1275,7 @@ function M:create(args)
 			target_str = target_str,
 			cwd_str = cwd_str,
 			create_after = create_after,
+			dialogs = dialogs,
 		})
 	end)
 end
@@ -1452,13 +1501,13 @@ function M:filter()
 		-- exactly like Yazi's native `filter` popup over a live native filter.
 		local stream = ya.input({
 			name = "filter",
-			title = "Filter: ",
+			title = dialogs.filter_title,
 			history = "shared",
 			value = initial,
-			-- Top-center input, plugin-chosen width 50 (stock's filter popup is
-			-- 80 wide); omitting `pos` leaves the popup zero-width and
-			-- invisible.
-			pos = { "top-center", y = 2, w = 50 },
+			-- Top-center input at stock's width/title so the popup matches the
+			-- native filter (stock's filter popup is 80 wide); omitting `pos`
+			-- leaves the popup zero-width and invisible.
+			pos = { "top-center", y = 2, w = dialogs.input_width },
 			realtime = true,
 			debounce = 0.05,
 		})
@@ -1645,7 +1694,7 @@ local function on_cd(payload)
 	end
 
 	if native_search_view() then
-		-- cd into a native fd/rg View: delegate the provider Folder entirely.
+		-- cd into a native provider View: delegate the provider Folder entirely.
 		-- Save the outgoing physical root's live state (t.root is still the
 		-- physical root), advance the tab's recorded root to the provider URL so
 		-- returning to the physical root is a real reroot that restores the
@@ -1678,7 +1727,7 @@ local function on_cd(payload)
 	-- restore (tree off) was deferred because the provider Folder must not be
 	-- reordered. Ordinary cds keep the baseline pin/restore timing (activate or
 	-- toggle), so the initial folder load is untouched.
-	local from_search_view = t.root ~= nil and is_search_url(t.root)
+	local from_search_view = t.root ~= nil and url_is_view(Url(t.root))
 	M.gen = M.gen + 1
 	M.active_tab = tab
 	t.root = root
@@ -1739,6 +1788,9 @@ end
 
 function M:setup(opts)
 	opts = opts or {}
+
+	-- Resolve the dialog geometry/titles before any action can open a popup.
+	dialogs = resolve_dialogs(type(opts.dialogs) == "table" and opts.dialogs or {})
 
 	-- Resolve and bind the layout/ratio + sort-handoff module first: setup
 	-- captures the base ratio and may assign the startup ratio, so the bound
@@ -1956,7 +2008,7 @@ function M:toggle()
 	end
 
 	if native_search_view() then
-		-- Toggling tree mode inside a native fd/rg View only records the tab's
+		-- Toggling tree mode inside a native provider View only records the tab's
 		-- desired mode and reflows the layout; sort pin/restore and root
 		-- reconciliation are deferred until the next physical cd applies them,
 		-- so the provider Folder is never mutated.

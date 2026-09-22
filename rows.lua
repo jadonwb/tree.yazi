@@ -98,6 +98,22 @@ local function rehydrate_rows()
 	return rows
 end
 
+-- Locale-independent byte comparison: the first differing byte decides, and a
+-- proper prefix sorts first (Lua's native `<` compiles to `strcoll`). A local
+-- copy keeps this sync-safe: a plugin-local `require` may yield, and
+-- seed_root_order can run outside a coroutine.
+local function bytes_lt(a, b)
+	local la, lb = #a, #b
+	local n = la < lb and la or lb
+	for i = 1, n do
+		local x, y = string.byte(a, i), string.byte(b, i)
+		if x ~= y then
+			return x < y
+		end
+	end
+	return la < lb
+end
+
 -- Directories-first alphabetical depth-0 URL order from the folder's real
 -- children, or nil when none are loaded yet. main.lua performs the guard checks
 -- (root_order/expanded already set, native provider View) and the M writes.
@@ -114,13 +130,15 @@ local function seed_root_order()
 	if #files == 0 then
 		return nil
 	end
+	-- Byte comparison, not Lua `<` (strcoll/locale-sensitive), so the seeded
+	-- order matches the emulated sort regardless of the process collation.
 	table.sort(files, function(a, b)
 		local ad = a.stat and a.stat.is_dir and true or false
 		local bd = b.stat and b.stat.is_dir and true or false
 		if ad ~= bd then
 			return ad
 		end
-		return tostring(a.name) < tostring(b.name)
+		return bytes_lt(tostring(a.name), tostring(b.name))
 	end)
 	local order = {}
 	for i, f in ipairs(files) do

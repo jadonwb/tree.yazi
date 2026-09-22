@@ -17,14 +17,21 @@ function M.nested_rename(ctx)
 	local old_url = Url(old_url_str)
 	local parent = old_url.parent
 
+	-- Dialog geometry/titles resolved by main.lua from setup()'s `dialogs`
+	-- option; the fallbacks keep stock values if a caller omits them.
+	local dialogs = ctx.dialogs or {}
+	local old_stat = fs.stat(old_url, false)
+
 	-- A realtime input returns immediately, so the input layer's own
 	-- `input:move` action can place the caret before the extension (the
 	-- stock `before_ext` placement) while the popup is already shown.
 	local stream = ya.input({
-		title = "Rename:",
+		-- The stock rename names restore the popup's bottom-right icon.
+		name = old_stat and old_stat.is_dir and "rename-dir" or "rename-file",
+		title = dialogs.rename_title or "Rename:",
+		history = "shared",
 		value = name,
-		-- TODO: input geometry is hardcoded; make width/location overridable so a filter-box plugin can support classic and tree view (see notes.txt).
-		pos = { "hovered", y = 1, w = 50 },
+		pos = { "hovered", y = 1, w = dialogs.input_width or 80 },
 		realtime = true,
 	})
 	if move then
@@ -61,9 +68,9 @@ function M.nested_rename(ctx)
 	if stat then
 		ya.dbg("[tree-dbg] nested rename overwrite prompt; new=", new_url_str)
 		local ok = ya.confirm({
-			pos = { "center", w = 60, h = 10 },
-			title = "Overwrite?",
-			body = "`" .. new_url_str .. "` already exists",
+			pos = { "center", w = dialogs.overwrite_width or 50, h = dialogs.overwrite_height or 15 },
+			title = dialogs.overwrite_title or "Overwrite file?",
+			body = dialogs.overwrite_body or "Will overwrite the following file:",
 		})
 		if not ok then
 			ya.dbg("[tree-dbg] nested rename overwrite declined; new=", new_url_str)
@@ -98,11 +105,13 @@ function M.create(ctx)
 	local cwd_str = ctx.cwd_str
 	local create_after = ctx.create_after
 
+	local dialogs = ctx.dialogs or {}
+
 	local value, event = ya.input({
 		name = "create-file",
-		title = "Create:",
+		title = dialogs.create_title or "Create:",
 		history = "shared",
-		pos = { "top-center", y = 2, w = 50 },
+		pos = { "top-center", y = 2, w = dialogs.input_width or 80 },
 	})
 	if event ~= 1 or value == nil or value == "" then
 		ya.dbg("[tree-dbg] create cancelled; event=", tostring(event))
@@ -150,9 +159,9 @@ function M.create(ctx)
 		if stat then
 			if not force then
 				local ok = ya.confirm({
-					pos = { "center", w = 60, h = 10 },
-					title = "Overwrite file?",
-					body = "`" .. joined_str .. "` already exists",
+					pos = { "center", w = dialogs.overwrite_width or 50, h = dialogs.overwrite_height or 15 },
+					title = dialogs.overwrite_title or "Overwrite file?",
+					body = dialogs.overwrite_body or "Will overwrite the following file:",
 				})
 				if not ok then
 					ya.dbg("[tree-dbg] create overwrite declined; url=", joined_str)
@@ -204,6 +213,106 @@ local function parse_entries(content)
 	return entries
 end
 
+-- Stock BulkCreate::opener: match the first [open] rule for a "text/plain"
+-- dummy, then walk that rule's `use` names in order and take the first blocking
+-- opener. Lua cannot construct stock's synthetic `bulk-create.txt` File, so the
+-- match is mime-only here; a url-based [open] rule keyed to that dummy name is
+-- not selected (the one divergence from stock).
+local function text_opener_run()
+	for _, rule in pairs(rt.open.rules:match({ mime = "text/plain" })) do
+		for _, name in ipairs(rule.use) do
+			local rules = rt.opener[name]
+			if rules then
+				for _, opener in pairs(rules:match()) do
+					if opener.block then
+						return opener.run
+					end
+				end
+			end
+		end
+		return nil
+	end
+	return nil
+end
+
+-- Stock Splatter for a single file, with ya.quote reproducing its platform
+-- quoting. A local temp file's content path and url are equal, so %s/%s1 and
+-- %S/%S1 are the file and %d/%d1 and %D/%D1 its parent; higher indices are
+-- empty, %h/%H and %y*/%Y* are empty, %t/%T consume the next token (a tab shift
+-- selects nothing from a one-file source), %% is a literal %, and any other
+-- %X stays a literal %X.
+local function splat_single(template, path, parent)
+	local quoted_path = ya.quote(path)
+	local quoted_parent = ya.quote(parent)
+	local n = #template
+
+	local function skip_digits(from)
+		local j = from
+		while j <= n do
+			local d = template:sub(j, j)
+			if d < "0" or d > "9" then
+				break
+			end
+			j = j + 1
+		end
+		return j
+	end
+
+	local out = {}
+	local i = 1
+	while i <= n do
+		local c = template:sub(i, i)
+		if c ~= "%" then
+			out[#out + 1] = c
+			i = i + 1
+		elseif i == n then
+			out[#out + 1] = "%"
+			i = i + 1
+		else
+			local t = template:sub(i + 1, i + 1)
+			if t == "%" then
+				out[#out + 1] = "%"
+				i = i + 2
+			elseif t == "s" or t == "S" or t == "d" or t == "D" then
+				local j = skip_digits(i + 2)
+				local idx = tonumber(template:sub(i + 2, j - 1))
+				if idx and idx >= 2 then
+					out[#out + 1] = "''"
+				elseif t == "s" or t == "S" then
+					out[#out + 1] = quoted_path
+				else
+					out[#out + 1] = quoted_parent
+				end
+				i = j
+			elseif t == "h" or t == "H" then
+				out[#out + 1] = "''"
+				i = i + 2
+			elseif t == "y" or t == "Y" then
+				i = skip_digits(i + 2)
+			elseif t == "t" or t == "T" then
+				-- Consume the following token; the shifted tab has no source.
+				i = i + 2
+				if i <= n then
+					if template:sub(i, i) == "%" and i < n then
+						local u = template:sub(i + 1, i + 1)
+						if u == "s" or u == "S" or u == "d" or u == "D" or u == "y" or u == "Y" then
+							i = skip_digits(i + 2)
+						else
+							i = i + 2
+						end
+					else
+						i = i + 1
+					end
+				end
+			else
+				out[#out + 1] = "%" .. t
+				i = i + 2
+			end
+		end
+	end
+	return table.concat(out)
+end
+
 -- Bulk create under the captured target without changing cwd. File entries use
 -- create_new, so an existing path is never overwritten.
 function M.bulk_create(ctx)
@@ -211,7 +320,12 @@ function M.bulk_create(ctx)
 	local cwd_str = ctx.cwd_str
 	local create_after = ctx.create_after
 
-	local editor = os.getenv("EDITOR") or "vi"
+	local run = text_opener_run()
+	if not run then
+		ya.dbg("[tree-dbg] bulk create has no blocking text opener")
+		ya.notify({ title = "Bulk create", content = "No text opener found", level = "warn", timeout = 5 })
+		return
+	end
 
 	local tmp_path = os.tmpname()
 	local tmp = Url(tmp_path)
@@ -226,13 +340,30 @@ function M.bulk_create(ctx)
 		return
 	end
 
+	-- Stock launches the expanded opener through the platform shell, blocking
+	-- with inherited stdio, in the tab cwd.
+	local tmp_dir = tmp.parent and tostring(tmp.parent) or ""
+	local cmd = splat_single(run, tmp_path, tmp_dir)
+
 	local permit = ui.hide()
-	local child, err = Command("sh")
-		:arg({ "-c", editor .. " " .. ya.quote(tmp_path) })
-		:stdin(Command.INHERIT)
-		:stdout(Command.INHERIT)
-		:stderr(Command.INHERIT)
-		:spawn()
+	local child, err
+	if ya.target_os() == "windows" then
+		child, err = Command("cmd.exe")
+			:arg({ "/Q", "/S", "/D", "/V:OFF", "/E:ON", "/C", cmd })
+			:cwd(cwd_str)
+			:stdin(Command.INHERIT)
+			:stdout(Command.INHERIT)
+			:stderr(Command.INHERIT)
+			:spawn()
+	else
+		child, err = Command("sh")
+			:arg({ "-c", cmd })
+			:cwd(cwd_str)
+			:stdin(Command.INHERIT)
+			:stdout(Command.INHERIT)
+			:stderr(Command.INHERIT)
+			:spawn()
+	end
 	if child then
 		child:wait()
 	end

@@ -131,13 +131,58 @@ local function random_key(seed, url)
 	return h
 end
 
+-- Locale-independent byte comparison: the first differing byte decides, and a
+-- proper prefix sorts first. Lua's native `<` compiles to `strcoll`, which is
+-- locale-sensitive; stock Yazi sorts on encoded bytes instead.
+local function bytes_lt(a, b)
+	local la, lb = #a, #b
+	local n = la < lb and la or lb
+	for i = 1, n do
+		local x, y = string.byte(a, i), string.byte(b, i)
+		if x ~= y then
+			return x < y
+		end
+	end
+	return la < lb
+end
+
+local function bytes_le(a, b)
+	return not bytes_lt(b, a)
+end
+
+-- -1/0/1 byte-order comparison of two strings.
+local function bytes_cmp(a, b)
+	if bytes_lt(a, b) then
+		return -1
+	elseif bytes_le(a, b) then
+		return 0
+	end
+	return 1
+end
+
+-- ASCII-only lowercase fold (bytes 65-90 -> 97-122). Lua's `:lower()` is
+-- ctype/locale dependent; stock Yazi folds ASCII only (`to_ascii_lowercase`).
+local function ascii_lower(s)
+	local out = {}
+	for i = 1, #s do
+		local b = string.byte(s, i)
+		if b >= 65 and b <= 90 then
+			b = b + 32
+		end
+		out[i] = string.char(b)
+	end
+	return table.concat(out)
+end
+
 -- Directories first, then the tab's captured sort preference. `pref` is a
 -- copied SortForm (or nil); every unsupported `by` (nil, none, custom) falls
 -- back to alphabetical. `dir_first` defaults to true and is never reversed. A
 -- tie on the primary key is resolved by `pref.fallback` (natural, or raw
 -- basename bytes for anything else). `natural` transliterates before comparing
--- when `pref.translit` is true; `random` orders by a frozen per-tab seed. A
--- final url comparison keeps the order deterministic.
+-- when `pref.translit` is true; `random` orders by a frozen per-tab seed. Every
+-- string key and tie-break compares encoded bytes, so the order is independent
+-- of the process locale, like stock Yazi. A final url comparison keeps the
+-- order deterministic.
 function M.sort_children(files, pref)
 	local by = pref and pref.by
 	if
@@ -159,6 +204,21 @@ function M.sort_children(files, pref)
 	local fallback = pref and pref.fallback
 	local seed = pref and pref.random_seed
 
+	-- Numeric primaries (size/mtime/btime) keep numeric compare; string
+	-- primaries (name/extension) compare by bytes, like stock Yazi.
+	local numeric = by == "mtime" or by == "btime" or by == "size"
+	local function key_cmp(x, y)
+		if not numeric then
+			return bytes_cmp(x, y)
+		end
+		if x < y then
+			return -1
+		elseif x > y then
+			return 1
+		end
+		return 0
+	end
+
 	-- Lazy sibling require (not a top-level one), resolved once per flatten.
 	local translit
 	if by == "natural" and pref and pref.translit then
@@ -171,7 +231,7 @@ function M.sort_children(files, pref)
 	local function name_key(f)
 		local n = tostring(f.name)
 		if not sensitive then
-			n = n:lower()
+			n = ascii_lower(n)
 		end
 		return n
 	end
@@ -184,7 +244,7 @@ function M.sort_children(files, pref)
 		local dot = n:match(".*()%.")
 		local e = dot and n:sub(dot + 1) or ""
 		if not sensitive then
-			e = e:lower()
+			e = ascii_lower(e)
 		end
 		return e
 	end
@@ -231,15 +291,9 @@ function M.sort_children(files, pref)
 				ord = 0
 			end
 		else
-			local pa, pb = primary(a), primary(b)
-			if pa ~= pb then
-				if reverse then
-					ord = pa > pb and -1 or 1
-				else
-					ord = pa < pb and -1 or 1
-				end
-			else
-				ord = 0
+			ord = key_cmp(primary(a), primary(b))
+			if reverse then
+				ord = -ord
 			end
 		end
 		if ord ~= 0 then
@@ -249,7 +303,7 @@ function M.sort_children(files, pref)
 		if fallback == "natural" then
 			ord = natsort(na, nb, false)
 		elseif na ~= nb then
-			ord = na < nb and -1 or 1
+			ord = bytes_lt(na, nb) and -1 or 1
 		else
 			ord = 0
 		end
@@ -261,9 +315,9 @@ function M.sort_children(files, pref)
 		end
 		local ua, ub = tostring(a.url), tostring(b.url)
 		if reverse then
-			return ua > ub
+			return bytes_lt(ub, ua)
 		end
-		return ua < ub
+		return bytes_lt(ua, ub)
 	end)
 end
 

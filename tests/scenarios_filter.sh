@@ -32,7 +32,9 @@ scenario_filter() {
 	filter_popup_is 'chi'
 	header_has '(filter: chi)' "header indicator while typing"
 	pane_has 'alpha'
-	pane_has 'child.txt'
+	# The stock-width (80) top-center popup overlaps the right edge of deeper
+	# rows, so the child row's tail is clipped while the popup is open.
+	pane_has 'child' "filtered child row visible"
 	pane_lacks 'beta.txt' "non-matching root hidden"
 	pane_lacks 'aa.txt' "non-matching root hidden"
 
@@ -198,7 +200,9 @@ scenario_toggle_filter() {
 	send_text 'gamma'
 	settle 0.8
 	header_has '(filter: gamma)'
-	pane_has 'gamma1.txt'
+	# The stock-width (80) popup overlaps the right edge of deeper rows, so
+	# the child row's tail is clipped while the popup is open.
+	pane_has 'gamma1'
 	pane_lacks 'alpha1.txt'
 	send_key Enter
 	settle 0.9
@@ -268,7 +272,9 @@ scenario_filter_roundtrip() {
 	settle 0.8
 	filter_popup_is 'gamma'
 	header_has '(filter: gamma)'
-	pane_has 'gamma1.txt'
+	# The stock-width (80) popup overlaps the right edge of deeper rows, so
+	# the child row's tail is clipped while the popup is open.
+	pane_has 'gamma1'
 	pane_lacks 'alpha1.txt'
 	send_key Enter
 	settle 0.9

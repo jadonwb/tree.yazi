@@ -308,7 +308,8 @@ scenario_overwrite() {
 	}
 
 	rename_to 'bbb.txt'
-	pane_has 'Overwrite?' "overwrite confirm should appear"
+	pane_has 'Overwrite file?' "overwrite confirm should appear"
+	pane_has 'Will overwrite the following file:' "stock overwrite body"
 	log_has 'nested rename overwrite prompt'
 
 	send_key n
@@ -320,7 +321,7 @@ scenario_overwrite() {
 	hovered_is 'aaa.txt' "cursor stays on the source after declining"
 
 	rename_to 'bbb.txt'
-	pane_has 'Overwrite?'
+	pane_has 'Overwrite file?'
 	send_key y
 	settle 1.4
 	file_absent "$FIXTURE/alpha/aaa.txt"

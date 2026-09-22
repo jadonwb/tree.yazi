@@ -294,6 +294,105 @@ scenario_paste() {
 	stop_session
 }
 
+# Paste ordering regression: a uniquified paste must sort below its original.
+# The emulated comparator and the seeded root order compare encoded bytes, not
+# the process collation, so the session is launched under a non-C LC_COLLATE
+# (en_US.UTF-8 down-weights punctuation in strcoll, which used to place
+# a_1.txt above a.txt).
+scenario_paste_order() {
+	new_env paste_order
+	write_config true adopt
+	make_fixture_paste
+	launch "$FIXTURE" "LC_ALL=en_US.UTF-8"
+
+	hovered_is 'dst'
+	send_key l
+	settle 1.0
+	hovered_is 'dst' "expand the destination"
+	send_key j
+	settle 0.4
+	hovered_is 'src'
+	send_key l
+	settle 1.0
+	send_key j
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key y
+	settle 0.4
+	send_key k
+	settle 0.4
+	hovered_is 'src'
+	send_key k
+	settle 0.4
+	hovered_is 'dst'
+	send_key p
+	settle 2.2
+	file_exists "$FIXTURE/dst/a.txt"
+
+	# The next normal paste collides and uniquifies to dst/a_1.txt, which must
+	# render after the original a.txt.
+	send_key j
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key j
+	settle 0.4
+	hovered_is 'src'
+	send_key j
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key y
+	settle 0.4
+	send_key k
+	settle 0.4
+	hovered_is 'src'
+	send_key k
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key k
+	settle 0.4
+	hovered_is 'dst'
+	send_key p
+	settle 2.2
+	file_exists "$FIXTURE/dst/a_1.txt"
+	line_before 'a.txt' 'a_1.txt' "a uniquified paste must sort after its original"
+
+	# A third unique paste makes a_2.txt, which must sort after a_1.txt.
+	send_key j
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key j
+	settle 0.4
+	hovered_is 'a_1.txt'
+	send_key j
+	settle 0.4
+	hovered_is 'src'
+	send_key j
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key y
+	settle 0.4
+	send_key k
+	settle 0.4
+	hovered_is 'src'
+	send_key k
+	settle 0.4
+	hovered_is 'a_1.txt'
+	send_key k
+	settle 0.4
+	hovered_is 'a.txt'
+	send_key k
+	settle 0.4
+	hovered_is 'dst'
+	send_key p
+	settle 2.2
+	file_exists "$FIXTURE/dst/a_2.txt"
+	line_before 'a_1.txt' 'a_2.txt' "the second unique paste must sort after the first"
+
+	snapshot paste_order
+	assert_log_clean
+	stop_session
+}
+
 # Cut paste moves a nested file, unyanks the cut set, and refreshes the
 # expanded source hierarchy so the moved row disappears.
 scenario_cut_paste() {
@@ -474,6 +573,34 @@ scenario_bulk_create_collision() {
 	hovered_is 'fresh.txt' "focus follows the first successfully created row"
 
 	snapshot bulk_create_collision
+	assert_log_clean
+	stop_session
+}
+
+# Bulk create honors the configured blocking text opener: with $EDITOR pointing
+# at a working marker editor, a custom [opener] edit rule must still be the one
+# launched, and the entries it writes must be created.
+scenario_bulk_create_opener() {
+	new_env bulk_create_opener
+	write_config true adopt
+	make_fixture_create
+	make_bulk_create_editor
+	make_text_opener_editor
+	printf 'opened.txt\n' >"$DIR/bulk_input"
+	launch "$FIXTURE" "EDITOR='$DIR/bulk_editor.sh'"
+
+	hovered_is 'alpha'
+	send_key l
+	settle 1.0
+	hovered_is 'alpha' "expand the destination"
+	send_key A
+	wait_file_exists "$DIR/opener_editor_ran" 15 "the configured opener should run"
+	wait_pane_has 'Continue to create?'
+	send_key y
+	wait_file_exists "$FIXTURE/alpha/opened.txt" 15
+	file_absent "$DIR/bulk_editor_ran" "the configured opener must take precedence over \$EDITOR"
+
+	snapshot bulk_create_opener
 	assert_log_clean
 	stop_session
 }

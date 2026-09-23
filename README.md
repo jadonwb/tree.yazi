@@ -131,12 +131,15 @@ component's `layout` and `_chunks` fields are left untouched.
 - **A root-level paste can appear at the bottom before re-sorting.** When the
   destination is the tree cwd, paste delegates to stock and the native
   `Upserting` hits the active folder; with the native sorter pinned to `none`
-  the entry is appended and painted, and only the later `duplicate`/`move` event
-  rebuilds it into place (bounded by the DDS pump's batching, up to about half a
-  second). A nested destination does not flash because its upsert is not
-  addressed to the visible folder. There is no pre-paint hook for this: `paste`
-  is not preflightable and the relay `update_files` op cannot be identified or
-  substituted from Lua.
+  the entry is appended and painted, and a later rebuild moves it into place.
+  The `duplicate`/`move` event usually does that first (bounded by the DDS
+  pump's batching, up to about half a second), and the root poll catches any
+  external root change within about one interval. A nested destination does not
+  flash because its upsert is not addressed to the visible folder. There is no
+  pre-paint hook for this: `paste` is not preflightable and the relay
+  `update_files` op cannot be identified or substituted from Lua. A root-level
+  *create* goes through `plugin tree create`, so the new row lands sorted
+  immediately and the cursor moves to it.
 - **Custom sort falls back to alphabetical.** While tree mode pins the tab's
   folder sort to `none` the captured sort is applied per directory, but
   `by = "custom"` falls back to alphabetical (bytewise, not locale collation)
@@ -166,10 +169,6 @@ component's `layout` and `_chunks` fields are left untouched.
 - **On a case-insensitive filesystem**: a rename that only changes the case asks
   before overwriting; stock Yazi just renames it, the plugin cannot perform
   Yazi's same-file check.
-- **Bulk create picks the text opener by file type, not name.** Yazi matches
-  `[open]` rules against a temporary file named `bulk-create.txt`, so a rule
-  keyed to that name can match. The plugin matches only the `text/plain` type,
-  so a name-based rule for `bulk-create.txt` is ignored.
 
 ## Architecture
 
@@ -332,6 +331,11 @@ run = "plugin tree create"
 desc = "Tree: create at hovered level or stock create"
 
 [[mgr.prepend_keymap]]
+on = "<C-a>"
+run = "plugin tree -- create --dir"
+desc = "Tree: create directory at hovered level or stock create --dir"
+
+[[mgr.prepend_keymap]]
 on = "A"
 run = "plugin tree bulk_create"
 desc = "Tree: bulk create at hovered level or stock bulk create"
@@ -389,26 +393,33 @@ desc = "Tree: new tab in tree cwd or stock smart tab"
 
 Outside a tree-mode tab the `plugin tree left`, `plugin tree right`,
 `plugin tree root_up`, `plugin tree root_down`, `plugin tree open`,
-`plugin tree create`, `plugin tree bulk_create`, `plugin tree paste`, and
-force-paste (`plugin tree -- paste --force`) actions emit Yazi's stock `leave`,
-`enter`, `back`, `forward`, `open`, `create`, `bulk_create`, and
-`paste`/`paste --force` actions, and `plugin tree filter`/`plugin tree escape`
-emit the stock `filter` and `escape` actions, so normal navigation, creation,
-bulk creation, paste, and filtering are unchanged. The `plugin tree rename`
-action emits stock rename with `cursor = "before_ext"` outside tree mode, on
-root-level rows, and with an active multi-selection, so ordinary renames and
-bulk renames keep stock caret placement and behavior. When tree mode is on but
-no tree filter is active, `plugin tree escape` also falls through to the stock
-escape cascade. The `plugin tree tab_create` action opens a new tab at the tree
-cwd in tree mode (ignoring the hover) and otherwise emits stock
-`tab_create --current`, so ordinary smart-tab behavior is unchanged. Mode
-routing is per-tab, so these fallbacks apply based on the active tab's own tree
-flag.
+`plugin tree create`, `plugin tree -- create --dir`, `plugin tree bulk_create`,
+`plugin tree paste`, and force-paste (`plugin tree -- paste --force`) actions
+emit Yazi's stock `leave`, `enter`, `back`, `forward`, `open`,
+`create`/`create --dir`, `bulk_create`, and `paste`/`paste --force` actions, and
+`plugin tree filter`/`plugin tree escape` emit the stock `filter` and `escape`
+actions, so normal navigation, creation, direct directory creation, bulk
+creation, paste, and filtering are unchanged. The `plugin tree rename` action
+emits stock rename with `cursor = "before_ext"` outside tree mode, on root-level
+rows, and with an active multi-selection, so ordinary renames and bulk renames
+keep stock caret placement and behavior. When tree mode is on but no tree filter
+is active, `plugin tree escape` also falls through to the stock escape cascade.
+The `plugin tree tab_create` action opens a new tab at the tree cwd in tree mode
+(ignoring the hover) and otherwise emits stock `tab_create --current`, so
+ordinary smart-tab behavior is unchanged. Mode routing is per-tab, so these
+fallbacks apply based on the active tab's own tree flag.
 
 The force-paste action uses the `plugin <name> -- <args>` form because Yazi's
 `--` separator is what keeps `--force` inside the plugin's own argument list. A
 plain `plugin tree paste --force` would parse `--force` as an argument of the
-outer `plugin` action and drop it before the plugin sees it.
+outer `plugin` action and drop it before the plugin sees it. The same form
+carries the `--dir` flag for the direct create-directory action
+(`plugin tree -- create --dir`).
+
+In tree mode `plugin tree create` creates at the hovered tree level (the hovered
+directory, else the hovered file's parent, else the tab cwd), and
+`plugin tree -- create --dir` mirrors stock `create --dir` with the
+"Create (dir):" input and no separator needed.
 
 The keybindings above are examples; adjust them if they conflict with your other
 actions or plugins.
@@ -452,21 +463,23 @@ require("tree"):setup({
 	-- Position/titles for the plugin-owned dialogs, defaulting to stock Yazi's
 	-- [input]/[confirm] values. A plugin has no native Lua binding for
 	-- yazi.toml's [input]/[confirm] sections, so it cannot read them and the
-	-- overrides live here. This covers the create/rename/filter inputs and the
-	-- create/rename overwrite confirms; the bulk-create "Continue to create?"
-	-- confirm is still hardcoded and not covered, and `create_title` is a single
-	-- string, so stock's "Create (dir):" directory variant is not reproduced. A
-	-- missing key or a wrong-typed value falls back to its default.
+	-- overrides live here. This covers the create/rename/filter inputs, the
+	-- overwrite confirms, and the bulk-create confirm; bulk create keeps its own
+	-- geometry because stock prompts on the raw TTY. A missing key or a
+	-- wrong-typed value falls back to its default.
 	dialogs = {
 		create_pos = { "top-center", y = 2, w = 80 },
 		rename_pos = { "hovered", y = 1, w = 80 },
 		filter_pos = { "top-center", y = 2, w = 80 },
 		overwrite_pos = { "center", w = 50, h = 15 },
+		bulk_create_pos = { "center", w = 60, h = 10 },
 		create_title = "Create:",
+		create_dir_title = "Create (dir):",
 		rename_title = "Rename:",
 		filter_title = "Filter:",
 		overwrite_title = "Overwrite file?",
 		overwrite_body = "Will overwrite the following file:",
+		bulk_create_title = "Continue to create?",
 	},
 })
 ```
@@ -474,10 +487,10 @@ require("tree"):setup({
 The overwrite confirms match stock's title, body, and position. Stock also
 renders an icon+URL file list in that confirm, but `ya.confirm` discards its
 `list` field, so a plugin cannot reproduce the list; title/position/body is the
-maximum parity available. `dialogs` covers only the create/rename/filter inputs
-and those overwrite confirms: the bulk-create "Continue to create?" confirm is
-hardcoded and not covered, and `create_title` is a single string, so stock's
-"Create (dir):" directory variant is not reproduced.
+maximum parity available. `dialogs` covers the create/rename/filter inputs,
+those overwrite confirms, and the bulk-create "Continue to create?" confirm;
+`create_title` and `create_dir_title` are the plain and `--dir` create popup
+titles.
 
 ## Diagnostics
 

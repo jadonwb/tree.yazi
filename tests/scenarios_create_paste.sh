@@ -56,7 +56,8 @@ scenario_create() {
 	[ -d "$FIXTURE/alpha/newdir" ] || fail "trailing separator should create a directory"
 	pane_has 'newdir'
 
-	# A root-level file resolves to cwd and delegates to stock create.
+	# A root-level file resolves to cwd; the plugin creates it there, so the new
+	# row lands sorted above rootfile.txt.
 	send_key k
 	settle 0.4
 	hovered_is 'alpha'
@@ -69,13 +70,41 @@ scenario_create() {
 	send_key a
 	settle 0.6
 	pane_has 'Create:'
-	send_text 'rootnew.txt'
+	send_text 'aaa.txt'
 	settle 0.3
 	send_key Enter
 	settle 1.5
-	file_exists "$FIXTURE/rootnew.txt"
+	file_exists "$FIXTURE/aaa.txt"
+	wait_pane_has 'aaa.txt'
+	line_before 'aaa.txt' 'rootfile.txt' "the plugin-handled root create must land sorted"
 
 	snapshot create
+	assert_log_clean
+	stop_session
+}
+
+# The poller covers the tree root: an external create there (no plugin action,
+# no recursive watcher) must land sorted. The root holds m.txt/rootfile.txt, so
+# a name sorting before both proves the re-sort.
+scenario_cwd_upsert_resort() {
+	new_env cwd_upsert_resort
+	write_config true adopt
+	make_fixture_create
+	printf 'M' >"$FIXTURE/m.txt"
+	launch "$FIXTURE"
+
+	hovered_is 'alpha'
+	pane_has 'm.txt'
+	pane_has 'rootfile.txt'
+
+	# Let the poller baseline the root once, then create a root file externally.
+	settle 1.5
+	printf 'AAA' >"$FIXTURE/aaa.txt"
+	wait_pane_has 'aaa.txt' 15 "the polled root change should rebuild the listing"
+	line_before 'aaa.txt' 'm.txt' "the polled root change must re-sort the new root row"
+	line_before 'aaa.txt' 'rootfile.txt' "the polled root change must re-sort the new root row"
+
+	snapshot cwd_upsert_resort
 	assert_log_clean
 	stop_session
 }
@@ -220,6 +249,63 @@ scenario_create_collisions() {
 	log_has 'create done'
 
 	snapshot create_collisions
+	assert_log_clean
+	stop_session
+}
+
+# Direct create-directory (`create --dir`): the bound key opens the
+# "Create (dir):" input; a plain name creates a directory under the hovered
+# level and cwd is unchanged. A root-level hover resolves to cwd and gets the
+# same popup.
+scenario_create_dir() {
+	new_env create_dir
+	write_config true adopt
+	add_create_dir_keymap
+	make_fixture_create
+	launch "$FIXTURE"
+
+	hovered_is 'alpha'
+	send_key l
+	settle 1.0
+	hovered_is 'alpha' "expand the destination"
+	send_key C-a
+	settle 0.6
+	pane_has 'Create (dir):' "create --dir popup"
+	send_text 'newdir'
+	settle 0.3
+	send_key Enter
+	settle 1.4
+	[ -d "$FIXTURE/alpha/newdir" ] || fail "create --dir should create a directory under the hovered dir"
+	file_absent "$FIXTURE/newdir" "create --dir must not join to the tab cwd"
+	header_has "$FIXTURE"
+	header_lacks "$FIXTURE/alpha" "create --dir must not change cwd"
+	pane_has 'newdir'
+	hovered_is 'newdir' "focus follows the created directory"
+
+	# A root-level hover resolves to cwd and the new directory is sorted into
+	# place.
+	send_key k
+	settle 0.4
+	hovered_is 'alpha'
+	send_key h
+	settle 1.0
+	hovered_is 'alpha'
+	send_key j
+	settle 0.4
+	hovered_is 'rootfile.txt'
+	send_key C-a
+	settle 0.6
+	pane_has 'Create (dir):' "plugin create --dir popup"
+	send_text 'rootdir'
+	settle 0.3
+	send_key Enter
+	settle 1.5
+	[ -d "$FIXTURE/rootdir" ] || fail "root-level create --dir should create a directory in the cwd"
+	header_has "$FIXTURE"
+	wait_pane_has 'rootdir'
+	line_before 'rootdir' 'rootfile.txt' "the plugin-handled root create --dir must land sorted"
+
+	snapshot create_dir
 	assert_log_clean
 	stop_session
 }
@@ -597,9 +683,10 @@ scenario_bulk_create_collision() {
 	stop_session
 }
 
-# Bulk create honors the configured blocking text opener: with $EDITOR pointing
-# at a working marker editor, a custom [opener] edit rule must still be the one
-# launched, and the entries it writes must be created.
+# Bulk create honors the configured blocking text opener: the harness installs a
+# url-keyed [open] rule for `*.txt` plus a custom [opener] edit rule; with
+# $EDITOR pointing elsewhere the url-keyed opener is still launched. A mime-only
+# match finds no opener, so the file match is what reaches it.
 scenario_bulk_create_opener() {
 	new_env bulk_create_opener
 	write_config true adopt

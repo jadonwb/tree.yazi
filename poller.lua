@@ -129,14 +129,15 @@ local function poll_scan(scope, lost)
 	return next(moves) and moves or nil, #prunes > 0 and prunes or nil
 end
 
--- One tick in the async context: read unfollowed metadata for every in-scope
--- expanded directory and compare it to the last successful snapshot. A missing
--- stat, a non-directory, a changed mtime/is_dir, or a changed (dev, btime) is a
--- real change; a directory seen for the first time only establishes its
--- baseline, so a fresh expansion never schedules a redundant rebuild. A lost or
--- replaced directory additionally enters the bounded identity scan above, and
--- the one hovered injected nested file is stat-followed so a content-only write
--- (which does not change the directory mtime) still refreshes the preview.
+-- One tick in the async context: read unfollowed metadata for the cwd root and
+-- every in-scope expanded directory and compare it to the last successful
+-- snapshot. A missing stat, a non-directory, a changed mtime/is_dir, or a
+-- changed (dev, btime) is a real change; a directory seen for the first time
+-- only establishes its baseline, so a fresh expansion never schedules a
+-- redundant rebuild. A lost or replaced directory additionally enters the
+-- bounded identity scan above, and the one hovered injected nested file is
+-- stat-followed so a content-only write (which does not change the directory
+-- mtime) still refreshes the preview.
 local function poll_tick(token, ctx)
 	local scope = ctx.scope(token)
 	if not scope then
@@ -183,13 +184,11 @@ local function poll_tick(token, ctx)
 			dirty = true
 		end
 	end
-	local rebuilt, empty_expansion =
-		ctx.apply(token, scope.gen, scope.tab, scope.root, sig, scope.visible, scope.hover_idx, dirty, moves, prunes)
-	-- The last live expansion key was pruned: end the loop instead of waking once
-	-- per interval for an empty scope. ctx.finish clears the handle afterwards.
-	if rebuilt and empty_expansion then
-		return false
-	end
+	ctx.apply(token, scope.gen, scope.tab, scope.root, sig, scope.visible, scope.hover_idx, dirty, moves, prunes)
+	-- The cwd root is always in scope, so there is no empty-scope tick to stop on:
+	-- the loop keeps running while the tab is still a tree. A nil scope (tree
+	-- off, classic tab, or a superseded loop) is what ends it; ctx.finish clears
+	-- the handle afterwards.
 	return true
 end
 

@@ -65,6 +65,8 @@ SCENARIOS=(
 	create
 	create_overwrite
 	create_collisions
+	create_dir
+	cwd_upsert_resort
 	bulk_create
 	bulk_create_collision
 	bulk_create_opener

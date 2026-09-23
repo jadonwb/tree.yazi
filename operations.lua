@@ -89,12 +89,13 @@ function M.nested_rename(ctx)
 	apply_nested_rename(old_url_str, new_url_str)
 end
 
--- Create under the captured target without changing cwd; a trailing separator
--- means directory. Any existing path prompts before replacement unless forced;
--- a directory cannot be replaced, so confirming surfaces the write error
--- (matching stock).
+-- Create under the captured target without changing cwd. `ctx.dir` mirrors
+-- stock `create --dir`; otherwise a trailing separator means directory. Any
+-- existing path prompts before replacement unless forced; a directory cannot be
+-- replaced, so confirming surfaces the write error (matching stock).
 function M.create(ctx)
 	local force = ctx.force
+	local dir = ctx.dir == true
 	local target_str = ctx.target_str
 	local cwd_str = ctx.cwd_str
 	local create_after = ctx.create_after
@@ -102,8 +103,8 @@ function M.create(ctx)
 	local dialogs = ctx.dialogs or {}
 
 	local value, event = ya.input({
-		name = "create-file",
-		title = dialogs.create_title or "Create:",
+		name = dir and "create-dir" or "create-file",
+		title = dir and (dialogs.create_dir_title or "Create (dir):") or (dialogs.create_title or "Create:"),
 		history = "shared",
 		pos = dialogs.create_pos,
 	})
@@ -113,11 +114,9 @@ function M.create(ctx)
 	end
 
 	local last = value:sub(-1)
-	local is_dir = last == "/" or last == "\\"
-	local name = value
-	if is_dir then
-		name = value:sub(1, -2)
-	end
+	local sep = last == "/" or last == "\\"
+	local is_dir = dir or sep
+	local name = sep and value:sub(1, -2) or value
 	if name == "" then
 		return
 	end
@@ -195,21 +194,31 @@ local function parse_entries(content)
 	return entries
 end
 
--- Stock BulkCreate::opener: first text/plain [open] rule, then the first
--- blocking opener in its use list.
+-- Stock BulkCreate::opener: match a synthetic `bulk-create.txt` file against
+-- the [open] rules (stock's match_dummy), so name/url-keyed rules are honored,
+-- then take the first blocking opener in the matched rule's use list.
 local function text_opener_run()
-	for _, rule in pairs(rt.open.rules:match({ mime = "text/plain" })) do
-		for _, name in ipairs(rule.use) do
-			local rules = rt.opener[name]
-			if rules then
-				for _, opener in pairs(rules:match()) do
-					if opener.block then
-						return opener.run
-					end
+	local st = Stat({ kind = 8, mode = 0x8000 })
+	local dummy = File({ url = Url("bulk-create.txt"), stat = st, lstat = st })
+
+	local first
+	for _, rule in pairs(rt.open.rules:match({ file = dummy, mime = "text/plain" })) do
+		first = rule
+		break
+	end
+	if not first then
+		return nil
+	end
+
+	for _, name in ipairs(first.use) do
+		local rules = rt.opener[name]
+		if rules then
+			for _, opener in pairs(rules:match()) do
+				if opener.block then
+					return opener.run
 				end
 			end
 		end
-		return nil
 	end
 	return nil
 end
@@ -295,6 +304,8 @@ function M.bulk_create(ctx)
 	local target_str = ctx.target_str
 	local cwd_str = ctx.cwd_str
 	local create_after = ctx.create_after
+
+	local dialogs = ctx.dialogs or {}
 
 	local run = text_opener_run()
 	if not run then
@@ -387,8 +398,8 @@ function M.bulk_create(ctx)
 		preview[#preview + 1] = entry.is_dir and (entry.path .. "/") or entry.path
 	end
 	local ok = ya.confirm({
-		pos = { "center", w = 60, h = 10 },
-		title = "Continue to create?",
+		pos = dialogs.bulk_create_pos,
+		title = dialogs.bulk_create_title or "Continue to create?",
 		body = table.concat(preview, "\n"),
 	})
 	if not ok then

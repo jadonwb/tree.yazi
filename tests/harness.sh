@@ -227,6 +227,17 @@ run = "hidden toggle"
 TOML
 }
 
+# Append a binding for the direct create-directory action (`plugin tree --
+# create --dir`; `--` keeps `--dir` in the plugin's argument list).
+add_create_dir_keymap() {
+	cat >>"$CFG/keymap.toml" <<'TOML'
+
+[[mgr.prepend_keymap]]
+on = "<C-a>"
+run = "plugin tree -- create --dir"
+TOML
+}
+
 # root fixture: alpha/child.txt, aa.txt, beta.txt
 make_fixture() {
 	rm -rf "$FIXTURE"
@@ -435,13 +446,18 @@ SH
 
 # Append a custom blocking text opener rule pointing at <script-path> to the
 # isolated yazi.toml, so configured-opener resolution can be proven independently
-# of $EDITOR (a user [opener] entry replaces the preset edit list).
+# of $EDITOR (a user [opener] entry replaces the preset edit list). The [open]
+# rules are replaced with a single url-keyed rule for `*.txt`, so the synthetic
+# `bulk-create.txt` file must match the rule, as in stock's match_dummy.
 make_custom_text_opener() {
 	local script="$1"
 	cat >>"$CFG/yazi.toml" <<TOML
 
 [opener]
 edit = [{ run = "$script %s", block = true }]
+
+[open]
+rules = [{ url = "*.txt", use = ["edit"] }]
 TOML
 }
 

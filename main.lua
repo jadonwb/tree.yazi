@@ -44,11 +44,14 @@ local DIALOG_DEFAULTS = {
 	rename_pos = { "hovered", y = 1, w = 80 },
 	filter_pos = { "top-center", y = 2, w = 80 },
 	overwrite_pos = { "center", w = 50, h = 15 },
+	bulk_create_pos = { "center", w = 60, h = 10 },
 	create_title = "Create:",
+	create_dir_title = "Create (dir):",
 	rename_title = "Rename:",
 	filter_title = "Filter:",
 	overwrite_title = "Overwrite file?",
 	overwrite_body = "Will overwrite the following file:",
+	bulk_create_title = "Continue to create?",
 }
 
 local dialogs = {
@@ -56,11 +59,14 @@ local dialogs = {
 	rename_pos = DIALOG_DEFAULTS.rename_pos,
 	filter_pos = DIALOG_DEFAULTS.filter_pos,
 	overwrite_pos = DIALOG_DEFAULTS.overwrite_pos,
+	bulk_create_pos = DIALOG_DEFAULTS.bulk_create_pos,
 	create_title = DIALOG_DEFAULTS.create_title,
+	create_dir_title = DIALOG_DEFAULTS.create_dir_title,
 	rename_title = DIALOG_DEFAULTS.rename_title,
 	filter_title = DIALOG_DEFAULTS.filter_title,
 	overwrite_title = DIALOG_DEFAULTS.overwrite_title,
 	overwrite_body = DIALOG_DEFAULTS.overwrite_body,
+	bulk_create_title = DIALOG_DEFAULTS.bulk_create_title,
 }
 
 -- Per-field: a right-typed value wins; omitted or wrong-typed falls back to the
@@ -799,10 +805,20 @@ local poll_scope = ya.sync(function(_, token)
 			hidden[#hidden + 1] = u
 		end
 	end
-	local urls = {}
+	-- The cwd root is added first and unconditionally (never a hidden-skip
+	-- key); expanded keys follow, deduped so a reroot's leftover root in
+	-- M.expanded is not repeated.
+	local urls, seen = {}, {}
+	local function add_url(u)
+		if not seen[u] then
+			seen[u] = true
+			urls[#urls + 1] = u
+		end
+	end
+	add_url(tostring(cx.active.current.cwd))
 	for url_str in pairs(M.expanded) do
 		if not hidden or not roots.in_any_subtree(url_str, hidden) then
-			urls[#urls + 1] = url_str
+			add_url(url_str)
 		end
 	end
 	table.sort(urls)
@@ -865,8 +881,7 @@ end)
 -- wholesale, pruning signatures for directories no longer expanded. `moves`
 -- (old URL -> new URL) and `prunes` (old URLs) are an external rename resolved
 -- by directory identity, applied through the same remap/prune machinery as the
--- rename/remove events. Returns (rebuilt, empty_expansion): the poll loop stops
--- when this tick pruned the last live expansion key.
+-- rename/remove events. Returns whether a rebuild was scheduled.
 local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, visible, hover_idx, dirty, moves, prunes)
 	if token ~= poll_token or not active_tree() then
 		return false
@@ -941,7 +956,6 @@ local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, visible, hove
 		add_candidate(candidate_at(i))
 	end
 	local focus = #candidates > 0 and candidates or nil
-	local empty_expansion = next(M.expanded) == nil
 	ya.dbg(
 		"[tree-dbg] poll change; gen=",
 		M.gen,
@@ -955,7 +969,7 @@ local poll_apply = ya.sync(function(_, token, gen, tab, root, sig, visible, hove
 	M.pending_focus = focus
 	ui.render()
 	rebuild(M.gen, focus)
-	return true, empty_expansion
+	return true
 end)
 
 -- Clear M.poller only if it still refers to the loop that just ended, so a
@@ -1197,7 +1211,9 @@ local create_after = ya.sync(function(_, cwd_str, target_str, joined_str)
 		ya.dbg("[tree-dbg] create finished after reroot; skipping rebuild")
 		return
 	end
-	if M.expanded[target_str] or M.injected or M.injecting then
+	-- A cwd target always rebuilds: it is the visible listing even with no
+	-- expansions.
+	if target_str == cwd_str or M.expanded[target_str] or M.injected or M.injecting then
 		M.gen = M.gen + 1
 		M.pending_focus = joined_str
 		ui.render()
@@ -1207,39 +1223,26 @@ local create_after = ya.sync(function(_, cwd_str, target_str, joined_str)
 	end
 end)
 
--- a: create at the hovered tree level. Outside tree mode, with no hover, or
--- when the resolved destination is the tree root, delegate to stock create
--- (which is byte-for-byte what is wanted there). A trailing path separator
--- selects directory creation; an existing file asks before being replaced.
+-- a: create at the hovered tree level; outside tree mode emit stock create.
 function M:create(args)
 	args = args or {}
 	local force = args.force == true
+	local dir = args.dir == true
 
 	if not active_tree() then
-		ya.emit("create", { force = force })
+		ya.emit("create", { dir = dir, force = force })
 		return
 	end
 
 	local h = hovered()
-	if not h then
-		ya.emit("create", { force = force })
-		return
-	end
-
-	local target = h.stat and h.stat.is_dir and h.url or h.url.parent
+	local target = h and (h.stat and h.stat.is_dir and h.url or h.url.parent) or nil
 	if not target then
-		ya.emit("create", { force = force })
-		return
+		target = cx.active.current.cwd
 	end
 
 	local cwd_str = tostring(cx.active.current.cwd)
 	local target_str = tostring(target)
-	if target_str == cwd_str then
-		ya.emit("create", { force = force })
-		return
-	end
-
-	ya.dbg("[tree-dbg] create target=", target_str, " force=", tostring(force))
+	ya.dbg("[tree-dbg] create target=", target_str, " force=", tostring(force), " dir=", tostring(dir))
 	ya.async(function()
 		if not operations then
 			require("tree.operations") -- async context: safe here
@@ -1247,6 +1250,7 @@ function M:create(args)
 		end
 		operations.create({
 			force = force,
+			dir = dir,
 			target_str = target_str,
 			cwd_str = cwd_str,
 			create_after = create_after,
@@ -1292,6 +1296,7 @@ function M:bulk_create(args)
 			target_str = target_str,
 			cwd_str = cwd_str,
 			create_after = create_after,
+			dialogs = dialogs,
 		})
 	end)
 end

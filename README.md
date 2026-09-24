@@ -1,74 +1,67 @@
-# tree-vfs-prototype
+# tree-vfs
 
-Disposable, isolated experiment answering whether Yazi b8973fb's experimental
-Lua **View** VFS provider can support a tree.yazi-style flattened hierarchy over
-real local files.
+Standalone experimental replacement for the tree workflow, implemented as a
+Yazi View provider. It is intentionally installed beside (not over) the
+production `tree.yazi` plugin. Target Yazi build: 26.9.1 @ `0ea4c5d`.
 
-It does **not** touch `~/.config/yazi`, the real `tree.yazi` plugin, or any
-chezmoi repository. All config, fixtures, state, logs and runtime sockets live
-below this directory.
+## Try it temporarily
 
-## Isolation
+Keep the normal `tree.yazi` installation and configuration intact. To switch
+manually, comment out the current `require("tree"):setup({...})` call in the
+user `init.lua` and use:
 
-| Var | Value |
-| --- | --- |
-| `YAZI_CONFIG_HOME` | `<root>/config` |
-| `XDG_CACHE_HOME` | `<root>/xdg/cache` |
-| `XDG_STATE_HOME` | `<root>/xdg/state` (log: `xdg/state/yazi/yazi.log`) |
-| `XDG_RUNTIME_DIR` | `<root>/xdg/run` |
-| `TMPDIR` | `<root>/xdg/tmp` |
-
-No tmux, no background daemons. The PTY harness is `harness/drive.py` (Python
-stdlib `pty`). Trash (`d`) is deliberately not exercised because it would write
-to the real XDG trash; permanent delete (`D`) is used instead.
-
-## Layout
-
-```
-config/vfs.toml                      [tree.default] kind="view" run="tree-vfs"
-config/init.lua                      View/Url-source compatibility probe
-config/keymap.toml                   t/l/h/R -> plugin tree-vfs actions
-config/yazi.toml                     sort_by="none", safe `probe` opener
-config/plugins/tree-vfs.yazi/main.lua  functional plugin + partial VFS provider
-harness/drive.py                     stdlib PTY driver
-tools/realcwd.sh                     option A: parse a view-URL cwd-file
-build-fixtures.sh                    reset fixture/state/out (prototype root only)
-check-compat.sh                      Gate 0
-run.sh                               manual isolated launcher
-test.sh                              automated PTY matrix
-cleanup.sh                           kill leftover prototype yazi, drop sockets
-logs/                                per-scenario .log/.raw + results.tsv
-RESULTS.md                           findings
-manual-checklist.md                  manual / out-of-scope items
+```lua
+local embedded_tree = os.getenv("YAZI_TREE") == "1"
+require("tree-vfs"):setup({
+  style = "indent",
+  startup = { tree = embedded_tree, preview = not embedded_tree },
+  filter_mode = "adopt",
+})
 ```
 
-## Usage
+In the corresponding tree keymap block, preserve each existing key and action
+but change the plugin prefix from `plugin tree` to `plugin tree-vfs`. In
+particular, retain the `--` separator and flags in
+`plugin tree-vfs -- create --dir` and `plugin tree-vfs -- paste --force`.
+Switch both init and keymap blocks together; Yazi selects plugins by directory
+name, so the `tree` keymap cannot invoke `tree-vfs`. Switching back means
+restoring the original tree setup and `plugin tree` block. This project does
+not edit the live Yazi configuration or provide an automatic backend switch.
+
+The plugin dynamically registers the `tree.default` View during setup; no
+`vfs.toml` edit is needed. It owns provider-specific read/refresh state while
+delegating file operations to Yazi's filesystem engine and task scheduler.
+
+## Tests
+
+Run the provider-specific gate from this checkout:
 
 ```sh
-./build-fixtures.sh      # create fixture + empty state
-./check-compat.sh        # Gate 0; exits 2 on unsupported build
-./test.sh                # full matrix (gate + scenarios), writes logs/
-./run.sh                 # manual interactive pane inspection
-./cleanup.sh             # after manual runs
+./tests/integration.sh --list
+./tests/integration.sh --jobs 4 modes_toggle_preview navigation_deep filter_live tabs_view_clone create_nested paste_nested rename_nested remove_nested external_hover_preview
 ```
 
-## Provider contract (b8973fb)
+The harness gives each scenario its own temporary config, fixture, XDG state,
+runtime directory and unique tmux server. It requires Yazi 26.9.1 @ `0ea4c5d`.
+Use `TREE_IT_ROOT=/path/to/tmp` to choose the external artifact parent and
+`TREE_IT_KEEP=1` to retain successful-run artifacts. Failed scenarios always
+retain their artifacts for diagnosis.
 
-`provide(job)` receives PascalCase `job.op`; `ReadDir` is a CoIter and must
-return `ya.co(function() coroutine.yield({ file = <File>, cha = <Cha> }) end)`.
-Every provider job runs in a fresh Lua state, so expansion state is kept in
-`state/expanded` (newline-separated absolute real paths) and re-read per job.
-Only `file`, `read_dir` and `revalidate` are declared; all other operations fall
-back to the Local engine through `Url::physical`.
+## Coverage and limitations
 
---cwd-file workaround: out/realcwd.txt is written on every cd (option C); `Q`
-runs the plugin quit override (option D); `tools/realcwd.sh` parses a view-URL
-cwd-file (option A). The `key-quit` preflight (option B) is a documented NO-GO.
+The selectable gate covers tree/preview pane ratios, h/l/H/L and linked-folder
+guarding, filtering, independent state for a newly created tab entering its own
+View, nested create/paste/rename, mutation refresh, and external-change polling
+without idle ReadDir churn. `tabs_view_clone` tests explicit entry into a
+provider View in the new physical tab; it does **not** claim that
+`tab_create --current` clones a View URL. The delete scenario verifies the
+provider refresh reconciliation event but does not assert deterministic
+physical deletion, because stock delete confirmation/selection was unreliable
+in the isolated UI fixture.
 
-**Non-obvious requirement:** a View URL built with the table constructor
-(`Url { Url(real), scheme="tree", domain=..., data=... }`) gets `Loc` `uri=0,
-urn=0`, i.e. an **empty `key()`**. `Entries::split_files` drops every row whose
-`key()` is empty, so such a folder renders as `No items` even though ReadDir
-returns files. Entry URLs must be produced by joining a relative path onto the
-folder URL (`folder:join(rel)`, the rg.lua shape), which yields a non-empty
-`urn` and therefore a non-empty `key()`.
+This is not full feature parity with the production plugin. Complex filter and
+hidden-file combinations, all native tab lifecycle cases, robust bulk-create
+dialog parity, broad trash/delete semantics, and the production suite's 91
+scenarios remain unported or unverified. Only the provider-specific scenarios
+listed above should be considered coverage; no general tree.yazi equivalence is
+claimed.

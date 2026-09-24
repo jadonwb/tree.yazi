@@ -1,476 +1,255 @@
--- Setup-installed filesystem mutation event reconciliation: rename/bulk-rename
--- and remove/transfer. The handlers are plain synchronous functions subscribed
--- by main.lua with ps.sub; every read and write of the plugin's mutable state
--- stays behind the bounded controller passed to bind(), so this module never
--- holds M.
+local function tree_state() return require("tree-vfs") end
+Current.redraw = require("tree-vfs.render").redraw
+local REALCWD = rt.path.runtime_dir .. "/tree-vfs-" .. tostring(ya.id("app")) .. ".cwd"
 
-local M = {}
-
--- Absolute-URL, path-boundary-safe subtree test shared by the event helpers.
-local function url_in_subtree(url_str, root_str)
-	return url_str == root_str or url_str:sub(1, #root_str + 1) == root_str .. "/"
+-- Keep the tree view's header location readable like a regular directory.
+-- The view URL remains the tab cwd; render its physical source instead.
+if not TVFS_HEADER_CWD then
+  TVFS_HEADER_CWD = Header.cwd
+  Header.cwd = function(self)
+    local cwd = self._current.cwd
+    local spec = cwd.spec
+    if spec.is_view and spec.scheme == "tree" and spec.domain == "default" then
+      local s = ya.readable_path(tostring(cwd.physical)) .. self:flags()
+      local max = self._area.w - self._right_width
+      return ui.Span(ui.truncate(s, { max = max, rtl = true })):style(th.mgr.cwd)
+    end
+    return TVFS_HEADER_CWD(self)
+  end
 end
 
-local function in_any_subtree(url_str, roots)
-	for _, r in ipairs(roots) do
-		if url_in_subtree(url_str, r) then
-			return true
-		end
-	end
-	return false
-end
-
--- `rename` carries the originating tab id; nil means the event has no tab scope.
-local function same_tab(tab)
-	if tab == nil then
-		return true
-	end
-	local id = cx.active.id
-	if type(id) == "userdata" then
-		id = id.value
-	end
-	return tonumber(tab) == id
-end
-
--- Nearest surviving ancestor directory of `url_str` inside the tree root. Walks
--- the cwd-relative path upward, skipping any ancestor removed by the same batch,
--- and returns nil for a root row (whose parent is the tree root, not a row). No
--- filesystem access: the event fires after the removal and every ancestor of a
--- removed path is itself a directory unless the same batch removed it.
-local function nearest_surviving_parent(ctl, url_str, removed)
-	local cwd = ctl.cwd()
-	local cwd_str = tostring(cwd)
-	local rel = ctl.rel_of(url_str)
-	local parent_rel = rel and rel:match("^(.*)/[^/]*$") or nil
-	while parent_rel and parent_rel ~= "" do
-		local candidate = tostring(cwd:join(parent_rel))
-		if candidate ~= cwd_str and not removed[candidate] then
-			return candidate
-		end
-		parent_rel = parent_rel:match("^(.*)/[^/]*$")
-	end
-	return nil
-end
-
--- Apply one (from, to) pair. Returns whether the injected hierarchy changes and
--- the remapped depth-0 order (nil when the plugin has no controlled order yet).
-local function rename_one(ctl, from_str, to_str)
-	local affected = false
-	local order = ctl.root_order()
-	if order then
-		for _, u in ipairs(order) do
-			if u == from_str then
-				affected = true
-				break
-			end
-		end
-	end
-
-	-- A renamed directory moves every expansion keyed below it, not just its
-	-- own key; without this the orphaned descendant keys silently collapse the
-	-- subtree and can resurrect stale expansion if the old URL returns.
-	if ctl.remap_expanded_prefix(from_str, to_str) then
-		affected = true
-	end
-
-	-- A rename inside an expanded subtree changes visible child rows even when
-	-- no controlled key itself moved.
-	for _, root in ipairs(ctl.expanded_keys()) do
-		if url_in_subtree(from_str, root) or url_in_subtree(to_str, root) then
-			affected = true
-			break
-		end
-	end
-
-	-- Preserve the renamed root's slot instead of re-deriving order from the
-	-- already-mutated flat folder (which appends the upserted entry).
-	local new_order
-	if order then
-		new_order = {}
-		for i, u in ipairs(order) do
-			new_order[i] = u == from_str and to_str or u
-		end
-	end
-
-	return affected, new_order
-end
-
--- Rename/bulk-rename: the injected rows and M.expanded are keyed by URL, so a
--- rename must remap metadata and rebuild before the hierarchy goes stale.
-local function on_rename(ctl, payload)
-	if not payload then
-		return
-	end
-	local from_str = payload.from and tostring(payload.from)
-	local to_str = payload.to and tostring(payload.to)
-	if not from_str or not to_str then
-		return
-	end
-
-	-- Saved per-root state of every tab is re-keyed regardless of which tab is
-	-- active or whether it is in tree mode, so a rename performed from a classic
-	-- tab cannot leave a tree tab's stale expansion keys pointing at the old URL.
-	ya.dbg(
-		"[tree-dbg] rename event from=",
-		from_str,
-		" to=",
-		to_str,
-		" tab=",
-		tostring(payload.tab),
-		" tabs=",
-		ctl.count_keys_tabs()
-	)
-	local saved_touched = ctl.remap_saved(from_str, to_str)
-
-	-- Live-state remap and the follow-up rebuild only apply when this event
-	-- belongs to the active tree tab. `rename` carries the originating tab id.
-	if not ctl.active_tree() or not same_tab(payload.tab) then
-		if saved_touched then
-			ya.dbg("[tree-dbg] rename saved-state re-key only; from=", from_str, " to=", to_str)
-		end
-		return
-	end
-	local affected, new_order = rename_one(ctl, from_str, to_str)
-	if not affected then
-		if saved_touched then
-			ya.dbg("[tree-dbg] rename saved-state re-key; from=", from_str, " to=", to_str)
-		end
-		return
-	end
-	ya.dbg("[tree-dbg] rename ", from_str, " -> ", to_str)
-	ctl.commit_mutation(to_str, nil, new_order)
-end
-
-local function on_bulk_rename(ctl, payload)
-	if not payload then
-		return
-	end
-
-	-- Build the simultaneous old-to-new map up front. Applying a payload
-	-- pairwise through pairs() is order-dependent: swaps (A->B, B->A) and
-	-- chains (A->B, B->C) would clobber each other's keys mid-iteration.
-	local map = {}
-	for from, to in pairs(payload) do
-		map[tostring(from)] = tostring(to)
-	end
-
-	-- Saved per-root state of every tab is re-keyed against the same untouched
-	-- map, including roots other than the active one, regardless of which tab is
-	-- active or whether it is in tree mode. A bulk rename performed from a
-	-- classic tab must not leave a tree tab's stale expansion keys behind.
-	local saved_touched = ctl.remap_saved_bulk(map)
-
-	-- Live-state remap and the follow-up rebuild only apply to the active tree
-	-- tab (bulk-rename carries no tab id, so scope by the active tree mode).
-	if not ctl.active_tree() then
-		if saved_touched then
-			ya.dbg("[tree-dbg] bulk-rename saved-state re-key only; pairs=", #map)
-		end
-		return
-	end
-
-	local function remap(url_str)
-		return map[url_str] or url_str
-	end
-
-	-- Destination of one cwd-relative path under the simultaneous map. A
-	-- directory move also carries every path beneath it, so the most specific
-	-- mapped ancestor (longest cwd-relative `from` prefix) wins; resolving each
-	-- original against the untouched map is what keeps swaps/chains
-	-- order-independent.
-	local function remap_rel(rel)
-		local best_from, best_to, best_len
-		for from_str, to_str in pairs(map) do
-			if from_str ~= to_str then
-				local from_rel = ctl.rel_of(from_str)
-				local to_rel = ctl.rel_of(to_str)
-				if from_rel and to_rel and from_rel ~= "" then
-					local suffix
-					if rel == from_rel then
-						suffix = ""
-					elseif rel:sub(1, #from_rel + 1) == from_rel .. "/" then
-						suffix = rel:sub(#from_rel + 1)
-					end
-					if suffix and (not best_len or #from_rel > best_len) then
-						best_from, best_to, best_len = from_rel, to_rel, #from_rel
-					end
-				end
-			end
-		end
-		if not best_from then
-			return nil
-		end
-		if best_from == rel then
-			return best_to
-		end
-		return best_to .. rel:sub(#best_from + 1)
-	end
-
-	local touched = false
-
-	-- Rebuild the controlled keys from a snapshot of their originals so every
-	-- pair is remapped exactly once, independent of payload order.
-	local expanded = ctl.expanded_keys()
-	local cwd = ctl.cwd()
-	local new_expanded = {}
-	for _, url_str in ipairs(expanded) do
-		local to_str = remap(url_str)
-		if to_str == url_str then
-			local rel = ctl.rel_of(url_str)
-			local mapped = rel and remap_rel(rel) or nil
-			if mapped then
-				to_str = tostring(cwd:join(mapped))
-			end
-		end
-		new_expanded[to_str] = true
-		if to_str ~= url_str then
-			touched = true
-		end
-	end
-
-	local order = ctl.root_order()
-	local new_root_order
-	if order then
-		new_root_order = {}
-		for i, url_str in ipairs(order) do
-			new_root_order[i] = remap(url_str)
-			if new_root_order[i] ~= url_str then
-				touched = true
-			end
-		end
-	end
-
-	-- A rename inside an expanded subtree changes visible child rows even when
-	-- no controlled key itself moved. The original set is still live here: the
-	-- replacement is only installed by commit_mutation below.
-	if not touched then
-		for from_str, to_str in pairs(map) do
-			for _, root in ipairs(ctl.expanded_keys()) do
-				if url_in_subtree(from_str, root) or url_in_subtree(to_str, root) then
-					touched = true
-					break
-				end
-			end
-			if touched then
-				break
-			end
-		end
-	end
-
-	if not touched then
-		if saved_touched then
-			ya.dbg("[tree-dbg] bulk-rename saved-state re-key only; pairs=", #map)
-		end
-		return
-	end
-
-	-- Deterministic focus: the smallest destination among the moved URLs, so
-	-- the cursor does not depend on pairs() order.
-	local dests = {}
-	for from_str, to_str in pairs(map) do
-		if to_str ~= from_str then
-			dests[#dests + 1] = to_str
-		end
-	end
-	table.sort(dests)
-	local focus = dests[1]
-
-	ya.dbg("[tree-dbg] bulk-rename applied; pairs=", #dests, " focus=", tostring(focus))
-	ctl.commit_mutation(focus, new_expanded, new_root_order)
+-- Tree view data is depth metadata, not a search query. Suppress only its
+-- spurious stock `(search: nil)` label; preserve stock flags everywhere else.
+if not TVFS_HEADER_FLAGS then
+  TVFS_HEADER_FLAGS = Header.flags
+  Header.flags = function(self)
+    local spec = self._current.cwd.spec
+    if spec.is_view and spec.scheme == "tree" and spec.domain == "default" then
+      local data = spec.data or {}
+      local module = require("tree-vfs")
+      local tab = module.tabs[tostring(data.tab)]
+      local root = tostring(self._current.cwd.physical)
+      local saved = tab and tab.roots[root]
+      return saved and saved.filter and (" (filter: " .. saved.filter .. ")") or ""
+    end
+    return TVFS_HEADER_FLAGS(self)
+  end
 end
 
 -- ---------------------------------------------------------------------------
--- Deletion (stock trash / permanent delete) and copy/move transfer. Native
--- remove already targets the selected-or-hovered URLs at any depth and keeps its
--- confirmation, task, and selection behavior; the plugin only reacts to the
--- successful completion events to prune the controlled hierarchy and rebuild.
--- ---------------------------------------------------------------------------
-
--- Bound handler factory: the two events differ only in their diagnostics label.
-local function on_remove(ctl, kind)
-	return function(payload)
-		local urls = payload and payload.urls
-		if type(urls) ~= "table" then
-			return
-		end
-
-		local removed = {}
-		local roots = {}
-		local all_removed = {}
-		local affected = false
-		for _, u in ipairs(urls) do
-			local u_str = tostring(u)
-			all_removed[#all_removed + 1] = u_str
-			local rel = ctl.rel_of(u_str)
-			if rel and rel ~= "" then
-				removed[u_str] = true
-				roots[#roots + 1] = u_str
-				local parent = Url(u_str).parent
-				local parent_str = parent and tostring(parent) or ""
-				if ctl.active_tree() and ctl.is_tree_parent(parent_str) then
-					affected = true
-				end
-			end
-		end
-		-- Saved per-root state of every tab is maintained regardless of which
-		-- tab is active or whether it is in tree mode: a removal performed from
-		-- a classic tab must still prune the stale expansion keys of a tree tab,
-		-- or a directory later recreated at the same URL would resurrect them.
-		-- Absolute-URL subtree tests, so roots other than the active one are
-		-- covered too.
-		local saved_touched = ctl.prune_saved(all_removed)
-		if not affected then
-			if saved_touched then
-				ya.dbg("[tree-dbg] " .. kind .. " saved-state prune only; urls=" .. #all_removed)
-			end
-			return
-		end
-
-		local pruned_expanded, pruned_rows = ctl.prune_for_removal(roots)
-
-		-- Focus anchor. Capture the pre-event hovered URL and the visible row
-		-- order, then anchor: (1) the hovered row when it survives outside every
-		-- removed subtree, (2) its nearest surviving parent row when the hovered
-		-- row was removed, (3) the nearest prior then nearest next surviving
-		-- visible row. Candidates are resolved in order by M:focus, so a
-		-- candidate later hidden by the active tree filter is skipped.
-		local h = ctl.hovered()
-		local hovered_str = h and tostring(h.url) or nil
-		local candidates, seen = {}, {}
-		local function add_candidate(u)
-			if u and not seen[u] then
-				seen[u] = true
-				candidates[#candidates + 1] = u
-			end
-		end
-
-		if hovered_str and ctl.rel_of(hovered_str) and not in_any_subtree(hovered_str, all_removed) then
-			add_candidate(hovered_str)
-		end
-		if hovered_str then
-			add_candidate(nearest_surviving_parent(ctl, hovered_str, removed))
-		end
-
-		local files = cx.active.current.files
-		local idx = 0
-		for i = 1, #files do
-			if hovered_str and tostring(files[i].url) == hovered_str then
-				idx = i
-				break
-			end
-		end
-		if idx == 0 then
-			idx = (cx.active.current.cursor or 0) + 1
-		end
-		local function survivor(u)
-			return ctl.rel_of(u) ~= nil and not in_any_subtree(u, all_removed)
-		end
-		for i = idx - 1, 1, -1 do
-			local u = tostring(files[i].url)
-			if survivor(u) then
-				add_candidate(u)
-			end
-		end
-		for i = idx + 1, #files do
-			local u = tostring(files[i].url)
-			if survivor(u) then
-				add_candidate(u)
-			end
-		end
-
-		local focus = #candidates > 0 and candidates or nil
-
-		ya.dbg(
-			"[tree-dbg] "
-				.. kind
-				.. " event urls="
-				.. #roots
-				.. " pruned_expanded="
-				.. pruned_expanded
-				.. " pruned_rows="
-				.. pruned_rows
-				.. " focus="
-				.. tostring(focus and focus[1])
-		)
-		ctl.commit_mutation(focus)
-	end
-end
-
--- Successful copy/move completion for an expanded (or cwd) branch: rebuild so
--- new children appear under their parent and moved-away rows disappear.
+-- Provider lifecycle, mutation reconciliation, physical header, and refresh gate.
 --
--- A move also removes the source path from the filesystem, so every tab's saved
--- roots are pruned for the moved-away `from` URLs regardless of the active tab's
--- mode; a duplicate only adds a destination and never invalidates saved state.
-local function on_transfer(ctl, kind)
-	return function(payload)
-		local items = payload and payload.items
-		if type(items) ~= "table" then
-			return
-		end
-
-		-- Move: drop saved roots/expansion keys under every moved-away source,
-		-- for every tab, before any active-tab routing.
-		if kind == "move" then
-			local froms = {}
-			for _, item in ipairs(items) do
-				if item.from then
-					froms[#froms + 1] = tostring(item.from)
-				end
-			end
-			if ctl.prune_saved(froms) then
-				ya.dbg("[tree-dbg] move saved-state prune; froms=", #froms)
-			end
-		end
-
-		if not ctl.active_tree() then
-			return
-		end
-
-		local affected = false
-		for _, item in ipairs(items) do
-			for _, key in ipairs({ "from", "to" }) do
-				local u = item[key]
-				if u then
-					local parent = Url(tostring(u)).parent
-					local parent_str = parent and tostring(parent) or ""
-					if ctl.is_tree_parent(parent_str) then
-						affected = true
-					end
-				end
-			end
-			if affected then
-				break
-			end
-		end
-		if not affected then
-			return
-		end
-
-		local h = ctl.hovered()
-		local focus = h and tostring(h.url) or nil
-		ya.dbg("[tree-dbg] transfer complete; kind=", kind, " items=", #items)
-		ctl.commit_mutation(focus)
-	end
+-- This file is loaded once with `exec_async`, so `ps.sub` callbacks run inside
+-- the same Lua state for the whole session. Callbacks are invoked from
+-- `app:accept_payload` / `core:preflight`, both wrapped in `Lives::scope`, so
+-- the `cx` global is available to them directly (no `ya.sync` needed).
+--
+-- DDS callbacks stay here because init.lua owns ps/cx. Expansion/filter state is
+-- in the provider module's main-runtime table; polling signs physical metadata.
+-- ---------------------------------------------------------------------------
+local function writefile(p, s)
+  local f = io.open(p, "w")
+  if not f then return end
+  f:write(s)
+  f:close()
+end
+local function emit_later(action, payload)
+  ya.async(function() ya.sleep(0); ya.emit(action, payload or {}) end)
 end
 
--- One-time bind/interface for the domain controller. Returns the plain
--- synchronous handlers main.lua subscribes with ps.sub.
-function M.bind(ctl)
-	return {
-		on_rename = function(payload)
-			on_rename(ctl, payload)
-		end,
-		on_bulk_rename = function(payload)
-			on_bulk_rename(ctl, payload)
-		end,
-		on_remove = function(kind)
-			return on_remove(ctl, kind)
-		end,
-		on_transfer = function(kind)
-			return on_transfer(ctl, kind)
-		end,
-	}
+local function remap_state(mappings)
+  local tvfs = tree_state()
+  table.sort(mappings, function(a, b) return #a[1] > #b[1] end)
+  local function mapped(p)
+    for _, pair in ipairs(mappings) do
+      local from, to = pair[1], pair[2]
+      if p == from then return to end
+      if p:sub(1, #from + 1) == from .. "/" then return to .. p:sub(#from) end
+    end
+    return p
+  end
+  for _, tab in pairs(tvfs.tabs) do
+    local roots = {}
+    for root, data in pairs(tab.roots) do
+      local expanded = {}
+      for p in pairs(data.expanded) do expanded[mapped(p)] = true end
+      roots[mapped(root)] = { expanded = expanded, order = data.order, filter = data.filter }
+    end
+    tab.roots = roots
+    if tab.root then tab.root = mapped(tab.root) end
+  end
+  if tvfs.root then tvfs.root = mapped(tvfs.root) end
 end
 
-return M
+local function prune_state(paths)
+  local tvfs = tree_state()
+  for _, tab in pairs(tvfs.tabs) do
+    for root, saved in pairs(tab.roots) do
+      local remove_root = false
+      for _, path in ipairs(paths) do
+        if path then
+          if root == path or root:sub(1, #path + 1) == path .. "/" then remove_root = true end
+          local prefix = path .. "/"
+          for expanded in pairs(saved.expanded) do
+            if expanded == path or expanded:sub(1, #prefix) == prefix then saved.expanded[expanded] = nil end
+          end
+        end
+      end
+      if remove_root then
+        tab.roots[root] = nil
+        if tab.root == root then tab.root = nil end
+        if tvfs.root == root then tvfs.root = nil end
+      end
+    end
+  end
+end
+
+local function physical(url)
+  local ok_, p = pcall(function() return tostring(url.physical or url) end)
+  if ok_ then return p end
+  return nil
+end
+
+local function active_physical()
+  local ok_, p = pcall(function()
+    return tostring(cx.active.current.cwd.physical or cx.active.current.cwd)
+  end)
+  if ok_ then return p end
+  return nil
+end
+
+local function is_view()
+  local ok_, s = pcall(function() return tostring(cx.active.current.cwd) end)
+  return ok_ and s:sub(1, 7) == "tree://"
+end
+
+local function write_realcwd()
+  local p = active_physical()
+  if p then
+    writefile(REALCWD, p)
+    ya.dbg("[tvfs] realcwd " .. p)
+  end
+end
+
+-- R1: after stock rename revealed the physical path, cd back into the view by
+-- revealing the renamed entry's view URL. `trail` is the root portal, so the
+-- reveal keeps the view; `key` is the root-relative path.
+local function reenter(to_physical)
+  local id = tostring(cx.active.id.value or cx.active.id)
+  local tvfs = tree_state()
+  local tab = tvfs.tabs[id]
+  local r = tab and tab.root
+  if not r then return end
+  local phys = tostring(to_physical)
+  if #phys <= #r or phys:sub(1, #r) ~= r or phys:sub(#r + 1, #r + 1) ~= "/" then
+    return
+  end
+  local ap = active_physical()
+  if ap and ap:sub(1, #r) ~= r then return end
+  local rel = phys:sub(#r + 2)
+  local portal = Url { Url(r), scheme = "tree", domain = "default", data = { depth = 0, tab = tonumber(id) or id } }
+  ya.dbg("[tvfs] reenter " .. rel)
+  emit_later("reveal", { target = portal:join(rel), raw = true, no_dummy = true })
+end
+
+local function handle_rename(from_url, to_url)
+  local from = physical(from_url)
+  local to = physical(to_url)
+  if not from or not to or from == to then return end
+  remap_state({ { from, to } })
+  reenter(to)
+end
+
+ps.sub("rename", function(body)
+  handle_rename(body.from, body.to)
+end)
+
+ps.sub("bulk-rename", function(body)
+  local mappings = {}
+  for from, to in pairs(body) do
+    local a, b = physical(from), physical(to)
+    if a and b and a ~= b then mappings[#mappings + 1] = { a, b } end
+  end
+  if #mappings == 0 then return end
+  remap_state(mappings)
+  table.sort(mappings, function(a, b) return #a[1] < #b[1] end)
+  for _, pair in ipairs(mappings) do reenter(pair[2]) end
+end)
+
+for _, kind in ipairs({ "move", "duplicate", "trash", "delete" }) do
+  local k = kind
+  ps.sub(k, function(body)
+    if k == "move" and type(body.items) == "table" then
+      local paths = {}
+      for _, item in ipairs(body.items) do if item.from then paths[#paths + 1] = physical(item.from) end end
+      prune_state(paths)
+    elseif (k == "trash" or k == "delete") and type(body.urls) == "table" then
+      local paths = {}
+      for _, url in ipairs(body.urls) do paths[#paths + 1] = physical(url) end
+      prune_state(paths)
+    end
+    if is_view() then
+      ya.dbg("[tvfs] refresh after " .. k)
+      emit_later("refresh", {})
+    end
+  end)
+end
+
+local function sync_active_view()
+  TVFS_IN_VIEW = is_view()
+  TVFS_TAB = tostring(cx.active.id.value or cx.active.id)
+  local cwd = cx.active.current.cwd
+  TVFS_ROOT = TVFS_IN_VIEW and tostring(cwd.physical) or nil
+  local state = tree_state()
+  local pending = state.pending_reveal
+  if not TVFS_IN_VIEW and pending and pending.tab == TVFS_TAB then
+    state.navigation[TVFS_TAB] = (state.navigation[TVFS_TAB] or 0) + 1
+    state.pending_reveal = nil
+    ya.dbg("[tvfs] cancel stale reveal on View exit root=" .. tostring(pending.root))
+  end
+  if not TVFS_IN_VIEW and not TVFS_STARTUP_APPLIED and state.options and state.options.startup.tree then
+    local physical = tostring(cwd.physical or cwd)
+    -- Bootstrap's first cwd may still be a `go://boot` portal, which cannot
+    -- itself be the source of a View. Wait for the physical path cd event.
+    if physical:sub(1, 1) ~= "/" and physical:sub(1, 7) ~= "sftp://" then return end
+    TVFS_STARTUP_APPLIED = true
+    local tab = tonumber(TVFS_TAB) or TVFS_TAB
+    ya.emit("cd", { Url { Url(physical), scheme = "tree", domain = "default", data = { depth = 0, tab = tab } }, raw = true })
+    return
+  end
+  if TVFS_IN_VIEW then
+    local tvfs = state
+    local data = cwd.spec.data or {}
+    local old_id = tostring(data.tab or TVFS_TAB)
+    if old_id ~= TVFS_TAB then
+      if not tvfs.tabs[TVFS_TAB] then
+        local source = tvfs.tabs[old_id]
+        local clone = { roots = {}, root = TVFS_ROOT }
+        if source then
+          for root, saved in pairs(source.roots) do
+            local expanded = {}; for p in pairs(saved.expanded) do expanded[p] = true end
+            clone.roots[root] = { expanded = expanded, order = saved.order, filter = saved.filter }
+          end
+        end
+        tvfs.tabs[TVFS_TAB] = clone
+      end
+      local root, tab_id = TVFS_ROOT, TVFS_TAB
+      ya.async(function()
+        ya.sleep(0.05)
+        local url = Url { Url(root), scheme = "tree", domain = "default", data = { depth = 0, tab = tonumber(tab_id) or tab_id } }
+        ya.emit("cd", { url, raw = true })
+      end)
+    end
+    local active = tvfs.tabs[TVFS_TAB]
+    if not active then active = { roots = {} }; tvfs.tabs[TVFS_TAB] = active end
+    active.roots[TVFS_ROOT] = active.roots[TVFS_ROOT] or { expanded = {}, order = {}, filter = nil }
+    active.root = TVFS_ROOT
+    tvfs.root = TVFS_ROOT
+  end
+  require("tree-vfs.layout").set_tree(TVFS_IN_VIEW)
+  write_realcwd()
+end
+ps.sub("cd", sync_active_view)
+ps.sub("tab", sync_active_view)
+
+return {}

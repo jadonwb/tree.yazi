@@ -1,2022 +1,450 @@
---- @since 26.9.1
---- @sync entry
---- Live recursive tree: lazily expand/collapse directories at any depth in
---- place while keeping Yazi's native Folder cursor, hover, and file entities.
-
-local M = {}
-
--- Installed by M:setup (async init.lua context); redraw paths are unreachable
--- without setup, so direct lazy `@sync entry` actions never see it as nil.
-local render
-
--- Raw module table for the async rebuild pass, resolved on the first rebuild
--- from inside the existing async context (same raw-cache pattern as render).
-local rebuild_pass
-
--- Raw module table for the async create/rename mutation passes, resolved on
--- first use from inside their existing async contexts (same raw-cache pattern).
-local operations
-
--- Raw module table for the setup-installed mutation event handlers, resolved
--- lazily inside the async init.lua context (same raw-cache pattern).
-local events
-
--- ---------------------------------------------------------------------------
--- Layout toggles (tree/preview) — unchanged behavior.
--- ---------------------------------------------------------------------------
-
--- Base ratio captured from rt.mgr.ratio while the active tab is idle (tree off,
--- preview on), plus the startup defaults newly observed tabs are seeded from.
--- Mode state itself lives per tab in M.tabs; there is no bare global flag.
-local base
-local startup_defaults = { tree = false, preview = true }
-
-local function tab_state(id)
-	return M.tabs[id or M.active_tab]
-end
-
--- Renderer/header/action routing authority. Before any lifecycle handler has
--- observed a tab (the very first frame of a startup launch) fall back to the
--- configured startup default so the first paint is already tree-shaped.
-local function active_tree()
-	local t = tab_state()
-	if t then
-		return t.tree == true
-	end
-	return startup_defaults.tree == true
-end
-
-local function capture_base()
-	local r = rt.mgr.ratio
-	base = { r[1], r[2], r[3] }
-	ya.dbg("[tree-dbg] captured base ratio=", base[1], base[2], base[3])
-end
-
--- A tab is idle (tree off, preview on) when its live ratio already equals the
--- canonical base, so an external ratio change observed now (manual config,
--- toggle-pane, etc.) is safe to adopt as the new base.
-local function is_idle(t)
-	return t ~= nil and not t.tree and t.preview
-end
-
-local function sync_base()
-	if is_idle(tab_state()) then
-		capture_base()
-	end
-end
-
-local function effective_ratio(t)
-	local p, c, v = base[1], base[2], base[3]
-	if not t.preview then
-		c, v = c + v, 0 -- preview space moves into current
-	end
-	if t.tree then
-		c, p = c + p, 0 -- parent space moves into current
-	end
-	return { p, c, v }
-end
-
--- The only writer of rt.mgr.ratio: recompose from the canonical base and the
--- active tab's own modes, then reflow. Inactive tabs are rendered only once
--- activated, when their own ratio is applied.
-local function apply_active()
-	local t = tab_state()
-	if not t then
-		return
-	end
-
-	if not base then
-		capture_base()
-	end
-
-	local ratio = effective_ratio(t)
-	ya.dbg(
-		"[tree-dbg] applying ratio=",
-		ratio[1],
-		ratio[2],
-		ratio[3],
-		"tree=",
-		tostring(t.tree),
-		"preview=",
-		tostring(t.preview)
-	)
-	rt.mgr.ratio = ratio
-	ya.emit("app:resize", {})
-end
-
--- Original preset Header.flags, captured once so setup() stays idempotent.
-local saved_header_flags
-
--- ---------------------------------------------------------------------------
--- Tree state (module table so it survives across entry calls).
--- ---------------------------------------------------------------------------
-
-M.expanded = {} -- set keyed by directory URL string, at any depth
-M.rows = {} -- per-URL metadata: { depth, last, cont } for injected rows
-M.gen = 0 -- generation, bumped by every sync user action
-M.pending_focus = nil -- URL string (or ordered candidate list) to reposition onto
-M.injected = false -- whether the last completed rebuild injected descendants
-M.injecting = false -- a rebuild is scheduled or in flight (not yet completed)
-M.root_order = nil -- authoritative depth-0 URL order (kept across rebuilds/rename)
-M.filter_query = nil -- active hierarchy-aware tree filter query; nil shows every row
-
--- Per-tab / per-root persistence. M.expanded/M.rows/M.root_order/M.filter_query
--- stay the live state for the active tab, while M.tabs owns everything that must
--- survive a tab switch: the tab's tree/preview modes, its sort/native-filter
--- handoff, its last-seen root, and its per-root expansion/order/tree-filter map.
--- Yazi restores a whole cached Folder (with the plugin's injected rows) on cd,
--- and `update_files` always targets the active tab, so the plugin must save the
--- outgoing tab itself and reconcile the incoming one against its saved set.
-M.active_tab = nil -- numeric id of the tab M.expanded/M.rows describe
-M.tabs = {} -- [tab_id] = { tree, preview, sort_saved, suspended_filter, root, roots }
--- roots[root_url] = { expanded=set, order=list|nil, filter=string|nil }
-
--- Tab ids arrive either as a Lua number or a userdata Id wrapper, from
--- cx.active.id and from the `cd`/`tab` event payloads.
-local function id_num(id)
-	if type(id) == "userdata" then
-		id = id.value
-	end
-	return tonumber(id)
-end
-
-local function active_id()
-	return id_num(cx.active.id)
-end
-
--- cwd of an arbitrary (possibly inactive) tab, looked up by numeric id. Used by
--- the cd handler to record a background tab's new root without touching the
--- live state the plugin is rendering for the active tab.
-local function tab_cwd(id)
-	for i = 1, #cx.tabs do
-		local tab = cx.tabs[i]
-		if id_num(tab.id) == id then
-			return tostring(tab.current.cwd)
-		end
-	end
-	return nil
-end
-
--- Native filtering is suspended for the whole injected-tree lifetime: a live
--- Entries filter is re-applied to every injected row and can orphan a child
--- from a hidden parent. The raw query is kept on the owning tab (t.suspended_filter)
--- so `suspend` can restore it and `adopt` can decide whether to hand the tree
--- query back, without bleeding between tabs.
--- How a native filter is transferred into (and out of) tree mode:
--- "adopt"   - apply it as the hierarchy-aware query, restore it on exit;
--- "suspend" - hide its effect while tree mode is on, restore it on exit;
--- "clear"   - discard it for good.
-local filter_mode = "adopt"
-
--- Injection tickets must never collide with the folder loader's own tickets,
--- which start at 1 and increment per folder load, or a late loader op can
--- invalidate an injection.
-M.seq = 1000000000
-
--- Per-tab sort handoff lives on M.tabs[id].sort_saved (see capture_sort below);
--- no process-global pin state.
-local cd_subscribed = false
-local tab_subscribed = false
-local mutate_subscribed = false
-local preflight_subscribed = false
-local transfer_subscribed = false
-local remove_subscribed = false
-
--- SortForm fields accepted by the `sort` action, captured for restoration.
-local SORT_FIELDS = { "by", "reverse", "dir_first", "sensitive", "translit", "fallback" }
-
-local function capture_sort()
-	local p = cx.active.pref
-	return {
-		by = p.sort_by,
-		reverse = p.sort_reverse,
-		dir_first = p.sort_dir_first,
-		sensitive = p.sort_sensitive,
-		translit = p.sort_translit,
-		fallback = p.sort_fallback,
-	}
-end
-
-local function copy_sort(s)
-	if not s then
-		return nil
-	end
-	local o = {}
-	for _, field in ipairs(SORT_FIELDS) do
-		o[field] = s[field]
-	end
-	return o
-end
-
--- Pin the active tree tab's folder ordering to `none` while injected hierarchy
--- is live, so the built-in sorter cannot interleave children among the root
--- entries. The configured sort is captured on the tab itself, never globally.
-local function pin_sort_for(t)
-	if not t or t.sort_saved then
-		return
-	end
-	t.sort_saved = capture_sort()
-	ya.dbg("[tree-dbg] pinning sort_by=none (was ", tostring(t.sort_saved.by), ")")
-	ya.emit("sort", { by = "none" })
-end
-
--- Restore a tab's configured sort preferences when it leaves tree mode.
-local function restore_sort_for(t)
-	if not t or not t.sort_saved then
-		return
-	end
-	local s = t.sort_saved
-	t.sort_saved = nil
-	ya.dbg("[tree-dbg] restoring sort_by=", tostring(s.by))
-	ya.emit("sort", {
-		by = s.by,
-		reverse = s.reverse,
-		dir_first = s.dir_first,
-		sensitive = s.sensitive,
-		translit = s.translit,
-		fallback = s.fallback,
-	})
-end
-
--- Preflight `key-sort`: while the active tab is in tree mode the flat Entries
--- list must stay unsorted or the injected hierarchy interleaves. Record what the
--- user asked for on the tab (so toggle-off restores it) and force by=none in
--- place.
-local function on_key_sort(form)
-	if not active_tree() then
-		return form
-	end
-	local t = tab_state()
-	if not t then
-		return form
-	end
-	if not t.sort_saved then
-		t.sort_saved = capture_sort()
-	end
-	for _, field in ipairs(SORT_FIELDS) do
-		if form[field] ~= nil then
-			t.sort_saved[field] = form[field]
-		end
-	end
-	form.by = "none"
-	ya.dbg("[tree-dbg] sort request captured; forcing by=none")
-	return form
-end
-
--- Preflight `key-hidden`: runs before Hidden::act, so the queued reassert is
--- processed after the hide/show change and rebuilds the controlled ordering.
-local function on_key_hidden(form)
-	if not active_tree() then
-		return form
-	end
-	ya.dbg("[tree-dbg] hidden toggle; scheduling reassert")
-	ya.emit("plugin", { "tree", "reassert" })
-	return form
-end
-
--- ---------------------------------------------------------------------------
--- Depth / connector helpers (pure; safe to call from the async callback).
--- ---------------------------------------------------------------------------
-
-local function relative_depth(f, cwd)
-	local rel = f.url:strip_prefix(cwd)
-	local rs = rel and tostring(rel) or ""
-	local depth = 0
-	for _ in rs:gmatch("/") do
-		depth = depth + 1
-	end
-	return depth
-end
-
--- Depth-0 url order as currently displayed; used only to seed M.root_order.
-local function capture_root_order()
-	local order = {}
-	for _, f in ipairs(cx.active.current.files) do
-		order[#order + 1] = tostring(f.url)
-	end
-	return order
-end
-
--- Code-point count without the utf8 library: counts bytes that are not UTF-8
--- continuation bytes, so multibyte names offset correctly (invalid UTF-8 is
--- approximated rather than matching Rust's lossy replacement).
-local function char_count(s)
-	return select(2, s:gsub("[^\128-\191]", ""))
-end
-
--- Stock `rename --cursor=before_ext` places the caret at the char index of the
--- last '.' for regular files, unless that index is 0. The popup opens with the
--- caret at end-of-value, so return the negative offset to emit.
-local function before_ext_move(name, regular)
-	if not regular then
-		return nil
-	end
-	local dot = name:match("[\0-\255]*()%.")
-	if not dot or dot == 1 then
-		return nil
-	end
-	return -char_count(name:sub(dot))
-end
-
--- Regular file test mirroring stock `hovered.is_file()`: directories, links,
--- and special files all keep the default end-of-value rename caret.
-local function is_regular(cha)
-	if not cha then
-		return false
-	end
-	return not (
-		cha.is_dir
-		or cha.is_link
-		or cha.is_indirect
-		or cha.is_fifo
-		or cha.is_sock
-		or cha.is_block
-		or cha.is_char
-	)
-end
-
--- ---------------------------------------------------------------------------
--- Native filter hand-off. Yazi's own Entries filter is a regex applied to every
--- injected row by Entries::split_files, so a live native filter would
--- double-filter the tree and can hide an ancestor while keeping its child.
--- Before any injection the plugin takes ownership: read the raw native query,
--- clear native filtering through `filter_do`, then adopt it into
--- hierarchy-aware matching, suspend it for later restore, or discard it.
--- ---------------------------------------------------------------------------
-
--- Transfer any live native filter. Idempotent: once cleared, the Folder reports
--- no filter and later calls are no-ops for the rest of the tree-mode session.
--- Returns true when a query was taken over.
-local function capture_native_filter()
-	local flt = cx.active.current.files.filter
-	local q = flt and tostring(flt) or nil
-	if not q or q == "" then
-		return false
-	end
-	ya.emit("filter_do", { "" })
-	if filter_mode == "adopt" then
-		M.filter_query = q
-	elseif filter_mode == "suspend" then
-		local t = tab_state()
-		if t then
-			t.suspended_filter = q
-		end
-	end
-	ya.dbg("[tree-dbg] native filter transferred; mode=", filter_mode, " query=", q)
-	return true
-end
-
--- Hand native filtering back when tree mode ends. Adopt restores the current
--- effective tree query (smart case, like the stock `filter --smart` binding),
--- suspend restores the query saved on this tab, clear restores nothing. `query`
--- is the effective tree query captured just before M.filter_query was reset.
-local function restore_native_filter(query)
-	local t = tab_state()
-	local q
-	if filter_mode == "adopt" then
-		q = query
-	elseif filter_mode == "suspend" then
-		q = t and t.suspended_filter or nil
-	end
-	if t then
-		t.suspended_filter = nil
-	end
-	if q and q ~= "" then
-		ya.emit("filter_do", { q, smart = true })
-		ya.dbg("[tree-dbg] native filter restored; mode=", filter_mode, " query=", q)
-	else
-		ya.dbg("[tree-dbg] native filter not restored; mode=", filter_mode)
-	end
-end
-
--- ---------------------------------------------------------------------------
--- Rebuild: async read of the root and every expanded directory, then a single
--- FilesOp reset + append + done injection into the active Folder.
--- ---------------------------------------------------------------------------
-
--- Stale guard: the async callback must not reset a folder owned by a newer
--- generation, and it must still belong to the tab it was captured for, because
--- `update_files` always targets the active tab. Runs in the sync context
--- (ya.sync) with access to M.
-local check_gen = ya.sync(function(_, gen, tab)
-	return M.gen == gen and M.active_tab == tab
-end)
-
--- The realtime filter stream runs in the async context and cannot touch `cx`,
--- so hand the query to the sync context through this bridge.
-local set_filter_query = ya.sync(function(_, query)
-	M.filter_query = query
-end)
-
--- Record the pruned depth-0 order observed by a completed rebuild so a later
--- rename event can remap a root's slot in place.
-local set_root_order = ya.sync(function(_, gen, tab, order)
-	if M.gen == gen and M.active_tab == tab then
-		M.root_order = order
-	end
-end)
-
--- Publish the per-row metadata (depth, last-sibling, ancestor continuation)
--- produced by the flatten, keyed by URL string, for the renderer and the
--- target-aware operations.
-local set_rows = ya.sync(function(_, gen, tab, rows)
-	if M.gen == gen and M.active_tab == tab then
-		M.rows = rows or {}
-	end
-end)
-
--- Completion marker: only the generation and tab that still own the folder may
--- clear the pending flag and record whether descendants are now injected. A
--- failed read passes nil and only clears the in-flight flag, or every later
--- toggle-off thinks a rebuild is still pending forever.
-local finish_rebuild = ya.sync(function(_, gen, tab, injected)
-	if M.gen == gen and M.active_tab == tab then
-		M.injecting = false
-		if injected ~= nil then
-			M.injected = injected
-		end
-	end
-end)
-
-local function rebuild(gen, focus_str, pin)
-	local tab = M.active_tab or active_id()
-	if not tab then
-		return
-	end
-	M.active_tab = tab
-
-	if pin ~= false then
-		pin_sort_for(tab_state(tab))
-	end
-
-	-- Take ownership of any native filter before reading the visible set: it
-	-- must stay off for the whole injected-tree lifetime, or injected rows get
-	-- re-filtered by urn and children can outlive their hidden parent.
-	capture_native_filter()
-
-	local cwd_str = tostring(cx.active.current.cwd)
-
-	-- Keep the per-tab root tracking current even when the plugin acts without
-	-- a preceding cd (for example the first expansion after toggle-on).
-	local t = tab_state(tab)
-	if t then
-		t.root = cwd_str
-	end
-
-	local expanded = {}
-	for url_str in pairs(M.expanded) do
-		expanded[#expanded + 1] = url_str
-	end
-	table.sort(expanded)
-
-	if not M.root_order then
-		M.root_order = capture_root_order()
-	end
-	local root_order = M.root_order
-	local filter = M.filter_query
-
-	local ticket = M.seq
-	M.seq = M.seq + 1
-	local injected = #expanded > 0
-	M.pending_focus = focus_str
-	M.injecting = true
-	-- Transient row metadata is owned by the flatten below: clearing it here
-	-- keeps a re-keyed expansion set from rendering against stale rows until
-	-- the rebuild publishes its own snapshot.
-	M.rows = {}
-
-	ya.dbg(
-		"[tree-dbg] rebuild gen=",
-		gen,
-		"ticket=",
-		ticket,
-		"expanded=",
-		#expanded,
-		"filter=",
-		tostring(filter),
-		"focus=",
-		tostring(focus_str)
-	)
-
-	ya.async(function()
-		if not rebuild_pass then
-			require("tree.rebuild") -- async context: safe here
-			-- Raw module table: plain sync entry, no require-proxy wrapper.
-			rebuild_pass = package.loaded["tree.rebuild"]
-		end
-		rebuild_pass.run({
-			gen = gen,
-			tab = tab,
-			cwd_str = cwd_str,
-			expanded = expanded,
-			root_order = root_order,
-			filter = filter,
-			ticket = ticket,
-			injected = injected,
-			focus_str = focus_str,
-			check_gen = check_gen,
-			set_root_order = set_root_order,
-			set_rows = set_rows,
-			finish_rebuild = finish_rebuild,
-		})
-	end)
-end
-
--- ---------------------------------------------------------------------------
--- Header indication: Yazi's stock Header renders "(filter: query)" solely from
--- the native Entries filter, which the plugin keeps cleared while it owns
--- hierarchy-aware filtering. Conditionally wrap Header:flags so the active tree
--- query shows beside the cwd in the stock style/placement; every other case
--- (tree mode off, no tree query) delegates to the untouched renderer.
--- ---------------------------------------------------------------------------
-
-local function install_header_filter()
-	if saved_header_flags or not (Header and Header.flags) then
-		return
-	end
-	saved_header_flags = Header.flags
-	Header.flags = function(self)
-		local q = active_tree() and M.filter_query or nil
-		if not q or q == "" then
-			return saved_header_flags(self)
-		end
-		-- Feed the stock renderer the plugin-owned query through the same field
-		-- it reads for native filtering, so the indicator's text, style, and
-		-- placement match exactly.
-		return saved_header_flags({
-			_current = { cwd = self._current.cwd, files = { filter = q } },
-			_tab = self._tab,
-		})
-	end
-end
-
--- ---------------------------------------------------------------------------
--- Key routing
--- ---------------------------------------------------------------------------
-
-local function hovered()
-	return cx.active.current.hovered
-end
-
-local function relative_of(file)
-	local rel = file.url:strip_prefix(cx.active.current.cwd)
-	return rel and tostring(rel) or ""
-end
-
--- Safety net: does the active folder currently hold any injected descendant
--- (depth > 0) rows? Used only on teardown, so the extra scan is bounded.
-local function has_descendants()
-	local cwd = cx.active.current.cwd
-	for _, f in ipairs(cx.active.current.files) do
-		local rel = f.url:strip_prefix(cwd)
-		local rs = rel and tostring(rel) or ""
-		if rs:find("/", 1, true) then
-			return true
-		end
-	end
-	return false
-end
-
--- cwd-relative path of an absolute URL string, or nil when it is outside the
--- current tree root. Used for path-boundary-safe subtree comparisons.
-local function rel_of(url_str)
-	local rel = Url(url_str):strip_prefix(cx.active.current.cwd)
-	return rel and tostring(rel) or nil
-end
-
--- ---------------------------------------------------------------------------
--- Per-tab / per-root state. Yazi restores a cached Folder (including the
--- injected descendant rows) before it emits `cd`, and the event carries only the
--- new tab/root, so the plugin tracks the outgoing root itself and saves its live
--- state before replacing it.
--- ---------------------------------------------------------------------------
-
-local function copy_set(s)
-	local o = {}
-	for k in pairs(s) do
-		o[k] = true
-	end
-	return o
-end
-
-local function copy_list(l)
-	if not l then
-		return nil
-	end
-	local o = {}
-	for i, v in ipairs(l) do
-		o[i] = v
-	end
-	return o
-end
-
--- Bounded diagnostic helper: how many keys a state table currently holds.
-local function count_keys(t)
-	local n = 0
-	for _ in pairs(t or {}) do
-		n = n + 1
-	end
-	return n
-end
-
--- Save a tree tab's live state under the root it currently describes. Called at
--- activation for the outgoing tab, at on_cd before any load, and from toggle-off
--- so the hierarchy survives a normal-mode interlude. Classic tabs save nothing:
--- their roots map stays frozen and their live set is always empty.
-local function save_live(id)
-	local t = M.tabs[id]
-	if not t or not t.tree or not t.root or t.root == "" then
-		return
-	end
-	local any = next(M.expanded) ~= nil or M.root_order ~= nil or (M.filter_query ~= nil and M.filter_query ~= "")
-	t.roots[t.root] = any and {
-		expanded = copy_set(M.expanded),
-		order = copy_list(M.root_order),
-		filter = M.filter_query,
-	} or nil
-end
-
--- Load a tab's frozen root state into the live working set. A classic tab always
--- loads an empty live set, so its roots map is never consulted while tree is off.
-local function load_roots(t, root)
-	local st = t and t.tree and t.roots[root] or nil
-	M.expanded = st and copy_set(st.expanded) or {}
-	M.root_order = st and copy_list(st.order) or nil
-	M.filter_query = st and st.filter or nil
-	M.rows = {}
-end
-
--- Regenerate M.rows for the rows already displayed, without a filesystem read.
--- Same math as redraw_tree's fallback, plus the parent URL M:left needs.
-local function rehydrate_rows()
-	local files, cwd = cx.active.current.files, cx.active.current.cwd
-	local depths = {}
-	for i = 1, #files do
-		depths[i] = relative_depth(files[i], cwd)
-	end
-	local rows, anc = {}, {}
-	for i = 1, #files do
-		local d = depths[i]
-		local last = true
-		for j = i + 1, #files do
-			local dj = depths[j]
-			if dj < d then
-				break
-			elseif dj == d then
-				last = false
-				break
-			end
-		end
-		local cont = {}
-		for level = 1, d - 1 do
-			cont[level] = not anc[level]
-		end
-		anc[d] = last
-		local rel = files[i].url:strip_prefix(cwd)
-		local pr = rel and tostring(rel):match("^(.*)/[^/]*$")
-		rows[tostring(files[i].url)] = {
-			depth = d,
-			last = last,
-			cont = cont,
-			parent = pr and pr ~= "" and tostring(cwd:join(pr)) or tostring(cwd),
-		}
-	end
-	M.rows = rows
-end
-
--- Synchronously remove restored descendant rows when the live expansion set is
--- empty. Emits the same part/part/done sequence rebuild uses, but reuses the
--- current Folder's depth-0 File userdata, so no filesystem read is needed and no
--- phantom row outlives on_cd.
-local function strip_descendants_sync()
-	local files, cwd = cx.active.current.files, cx.active.current.cwd
-	local cwd_str = tostring(cwd)
-	local real = {}
-	for i = 1, #files do
-		local rel = files[i].url:strip_prefix(cwd)
-		if rel and not tostring(rel):find("/", 1, true) then
-			real[#real + 1] = files[i]
-		end
-	end
-	local ticket = M.seq
-	M.seq = M.seq + 1
-	ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd_str), files = {} }) })
-	ya.emit("update_files", { op = fs.op("part", { id = ticket, url = Url(cwd_str), files = real }) })
-	ya.emit("update_files", {
-		op = fs.op("done", { id = ticket, file = cx.active.current.file }),
-	})
-	M.injected, M.injecting = false, false
-end
-
--- Make the live expansion set and the displayed rows agree in this handler, then
--- optionally re-flatten from disk. When the restored set is empty but the Folder
--- still carries injected descendants they are stripped synchronously; when
--- expansions exist the existing generation-checked rebuild validates the keys
--- and rereads disk (so `h`/`l` never observe expanded rows with an empty state).
-local function reconcile_root()
-	M.pending_focus = nil
-	local exp, has = next(M.expanded) ~= nil, has_descendants()
-	if has and not exp then
-		ya.dbg("[tree-dbg] reconcile strip; root=", tostring(cx.active.current.cwd))
-		strip_descendants_sync()
-		rehydrate_rows()
-	else
-		rehydrate_rows()
-		M.injected, M.injecting = exp, false
-		if exp then
-			M.gen = M.gen + 1
-			rebuild(M.gen, nil)
-		end
-	end
-end
-
--- Forget `target` and every expanded directory inside its subtree, comparing
--- cwd-relative paths so collapsing "a/b" never matches "a/bc".
-local function prune_expanded(target_str)
-	local cwd = cx.active.current.cwd
-	local target_rel = tostring(Url(target_str):strip_prefix(cwd) or "")
-	if target_rel == "" then
-		return false
-	end
-	local prefix = target_rel .. "/"
-	local removed = false
-	for u in pairs(M.expanded) do
-		local rel = tostring(Url(u):strip_prefix(cwd) or "")
-		if rel == target_rel or rel:sub(1, #prefix) == prefix then
-			M.expanded[u] = nil
-			removed = true
-		end
-	end
-	return removed
-end
-
--- ---------------------------------------------------------------------------
--- Rename / bulk-rename: the injected rows and M.expanded are keyed by URL, so a
--- rename must remap metadata and rebuild before the hierarchy goes stale.
--- ---------------------------------------------------------------------------
-
--- Absolute-URL re-key for saved per-root state. Unlike remap_expanded_prefix
--- this never consults the active cwd, so it can address the saved sets of roots
--- other than the active one. `url_str` outside the moved subtree is unchanged.
-local function remap_abs(url_str, from_str, to_str)
-	if url_str == from_str then
-		return to_str
-	end
-	local prefix = from_str .. "/"
-	if url_str:sub(1, #prefix) == prefix then
-		return to_str .. url_str:sub(#from_str)
-	end
-	return url_str
-end
-
--- Simultaneous absolute-URL resolution for a bulk-rename map: the most specific
--- mapped ancestor wins, so swaps and chains stay order-independent.
-local function remap_abs_bulk(map, url_str)
-	local best_from, best_to, best_len
-	for from_str, to_str in pairs(map) do
-		if from_str ~= to_str then
-			if url_str == from_str then
-				return to_str
-			end
-			if url_str:sub(1, #from_str + 1) == from_str .. "/" then
-				if not best_len or #from_str > best_len then
-					best_from, best_to, best_len = from_str, to_str, #from_str
-				end
-			end
-		end
-	end
-	if not best_from then
-		return url_str
-	end
-	return best_to .. url_str:sub(#best_from)
-end
-
--- Re-keyed copy of an expansion key set under `resolve`, computed against the
--- untouched original keys so a swap/chain cannot resolve twice. Returns the new
--- set plus whether any key actually moved.
-local function remap_key_set(exp, resolve)
-	local out, moved = {}, false
-	for k in pairs(exp) do
-		local nk = resolve(k)
-		if nk ~= k then
-			moved = true
-		end
-		out[nk] = true
-	end
-	return out, moved
-end
-
--- Re-keyed copy of a root-order list under `resolve`.
-local function remap_list(order, resolve)
-	local out = {}
-	for i, v in ipairs(order) do
-		out[i] = resolve(v)
-	end
-	return out
-end
-
--- Apply `resolve` to every tab's saved roots, saved expansion keys, and saved
--- root-order entries, plus each tab's last-seen root. Collected first, then
--- re-keyed, so swaps/chains resolve against the untouched originals. Every tab
--- is visited, not just the active one, so a mutation performed from a classic
--- tab can never leave a tree tab's frozen roots pointing at a moved URL.
+-- Experimental tree-vfs View provider for Yazi 26.9.1 @ 0ea4c5d.
+-- Dual role, like the in-tree rg.lua: functional plugin (M:entry) + VFS
+-- provider (M:provide). Provider jobs bridge to the main plugin state via
+-- top-level ya.sync blocks.
 --
--- A root's *own* URL usually does not move when a path inside it is renamed, so
--- the expansion keys and root order of every root are re-keyed independently of
--- whether that root itself was re-keyed.
-local function remap_saved_generic(resolve)
-	local changed = false
-	for _, t in pairs(M.tabs) do
-		local saved_roots = t.roots
+-- Provider contract notes:
+--   * ReadDir is a CoIter yielding bare File values with stat/lstat metadata.
+--   * A View URL built with the table constructor has Loc urn=0, i.e. an
+--     empty `key()`; Entries::split_files drops empty-key rows. Entry URLs
+--     must therefore be produced by joining a relative path onto the folder
+--     URL (the rg.lua shape), which yields a non-empty urn.
+--   * Capabilities declares only file/read_dir/revalidate; every other op
+--     falls back to the Local engine through Url::physical.
+--
+-- Increment 2 additions (prototype-only):
+--   * `enter` records the view root in per-tab in-memory state.
+--   * `paste`/`paste-force` compute a hovered-target-aware destination and
+--     delegate the I/O to Yazi's native task scheduler using view URLs.
+--   * `quit` is the plugin-contained "cd to physical then quit" workaround.
+--   * Rename re-entry / state remap / post-op refresh live in config/init.lua.
+local M = {}
+local operations = require("tree-vfs.operations")
+M.navigation = {}
 
-		-- Snapshot every (root, state) pair and resolve it against the untouched
-		-- originals before writing anything back, so a swap (A->B, B->A) or a
-		-- chain (A->B, B->C) cannot clobber its own source mid-iteration.
-		local entries = {}
-		for root, state in pairs(saved_roots) do
-			local new_keys, keys_moved
-			if state and state.expanded then
-				new_keys, keys_moved = remap_key_set(state.expanded, resolve)
-			end
-			entries[#entries + 1] = {
-				root = root,
-				state = state,
-				new_root = resolve(root),
-				new_keys = new_keys,
-				keys_moved = keys_moved,
-				new_order = state and state.order and remap_list(state.order, resolve) or nil,
-			}
-		end
-		for _, e in ipairs(entries) do
-			saved_roots[e.root] = nil
-		end
-		for _, e in ipairs(entries) do
-			if e.new_root ~= e.root or e.keys_moved then
-				changed = true
-			end
-			local state = e.state
-			if state then
-				if e.new_keys then
-					state.expanded = e.new_keys
-				end
-				if e.new_order then
-					state.order = e.new_order
-				end
-			end
-			saved_roots[e.new_root] = state
-		end
+local DOMAIN = "default"
+local REALCWD = rt.path.runtime_dir .. "/tree-vfs-" .. tostring(ya.id("app")) .. ".cwd"
+M.tabs, M.root = {}, nil
+local configured = false
+local options = { style = "lines", filter_mode = "adopt", startup = { tree = false, preview = true } }
 
-		if t.root then
-			local new_root = resolve(t.root)
-			if new_root ~= t.root then
-				t.root = new_root
-				changed = true
-			end
-		end
-	end
-	return changed
+local function tab_state(state, tab, root)
+  tab = tostring(tab or "")
+  state.tabs[tab] = state.tabs[tab] or { roots = {} }
+  local t = state.tabs[tab]
+  t.roots[root] = t.roots[root] or { expanded = {}, order = {}, filter = nil }
+  return t, t.roots[root]
 end
 
-local function remap_saved(from_str, to_str)
-	return remap_saved_generic(function(u)
-		return remap_abs(u, from_str, to_str)
-	end)
+local read_provider_state = ya.sync(function(state, tab, root)
+  local _, r = tab_state(state, tab, root)
+  local expanded = {}
+  for path in pairs(r.expanded) do expanded[#expanded + 1] = path end
+  return expanded, r.filter, r.order or {}
+end)
+local commit_provider_state = ya.sync(function(state, tab, root, expanded, filter, order)
+  local t, r = tab_state(state, tab, root)
+  if expanded then
+    r.expanded = {}
+    for _, path in ipairs(expanded) do r.expanded[path] = true end
+  end
+  if filter ~= nil then r.filter = filter ~= "" and filter or nil end
+  if order ~= nil then r.order = order end
+  t.root, state.root = root, root
+  return true
+end)
+local remap_provider_state = ya.sync(function(state, from, to)
+  local function mapped(path)
+    if path == from then return to end
+    if path:sub(1, #from + 1) == from .. "/" then return to .. path:sub(#from) end
+    return path
+  end
+  for _, tab in pairs(state.tabs) do
+    local roots = {}
+    for root, data in pairs(tab.roots) do
+      local nr, nd = mapped(root), { expanded = {}, order = data.order, filter = data.filter }
+      for path in pairs(data.expanded) do nd.expanded[mapped(path)] = true end
+      roots[nr] = nd
+    end
+    tab.roots = roots
+    if tab.root then tab.root = mapped(tab.root) end
+  end
+  if state.root then state.root = mapped(state.root) end
+end)
+M.remap_state = remap_provider_state
+
+local function write_file(path, data)
+  local f, err = io.open(path, "w")
+  if not f then return nil, err end
+  f:write(data)
+  f:close()
+  return true
 end
 
-local function remap_saved_bulk(map)
-	return remap_saved_generic(function(u)
-		return remap_abs_bulk(map, u)
-	end)
+-- Build a view portal URL: [1] is the real source URL; data carries state.
+local function view_url(real, depth, tab, filter)
+  return Url { Url(real), scheme = "tree", domain = DOMAIN, data = { depth = depth or 0, tab = tab, filter = filter } }
 end
 
--- Absolute-URL, path-boundary-safe subtree membership. The events module has
--- its own copy; this one serves prune_saved, which stays behind the controller.
-local function in_any_subtree(url_str, roots)
-	for _, r in ipairs(roots) do
-		if url_str == r or url_str:sub(1, #r + 1) == r .. "/" then
-			return true
-		end
-	end
-	return false
+-- Real metadata for an already-built view URL (entry or portal).
+local function file_from_url(url)
+  local f, err = fs.file(Url(url.physical)) -- async; real local metadata
+  if not f then return nil, err end
+  ya.dbg(string.format(
+    "[tvfs] file %s len=%s dir=%s",
+    tostring(url.physical),
+    tostring(f.stat and f.stat.len),
+    tostring(f.stat and f.stat.is_dir)
+  ))
+  return File { url = url, stat = f.stat, lstat = f.lstat, link_to = f.link_to }
 end
 
--- Drop saved roots inside any removed URL, saved expansion keys inside them, and
--- the matching last-seen root of any tab. Absolute-URL tests, because a removed
--- URL may belong to a saved root other than the active one.
-local function prune_saved(roots)
-	local changed = false
-	for _, t in pairs(M.tabs) do
-		local saved_roots = t.roots
-		local drop = {}
-		for root, state in pairs(saved_roots) do
-			if in_any_subtree(root, roots) then
-				drop[#drop + 1] = root
-			elseif state and state.expanded then
-				for k in pairs(state.expanded) do
-					if in_any_subtree(k, roots) then
-						state.expanded[k] = nil
-						changed = true
-					end
-				end
-			end
-		end
-		for _, root in ipairs(drop) do
-			saved_roots[root] = nil
-			changed = true
-		end
-		if t.root and in_any_subtree(t.root, roots) then
-			t.root = nil
-			changed = true
-		end
-	end
-	return changed
+local function walk(real, depth, expanded, out, hidden, order)
+  local files, err = fs.read_dir(Url(real), { resolve = true })
+  if not files then return out, err end
+  local rank = {}
+  if depth == 0 and order then for i, name in ipairs(order) do rank[name] = i end end
+  table.sort(files, function(a, b)
+    local ad, bd = a.stat and a.stat.is_dir, b.stat and b.stat.is_dir
+    if ad ~= bd then return ad == true end
+    if depth == 0 and order then
+      local ar, br = rank[tostring(a.name)] or math.huge, rank[tostring(b.name)] or math.huge
+      if ar ~= br then return ar < br end
+    end
+    return tostring(a.name) < tostring(b.name)
+  end)
+  for _, f in ipairs(files) do
+    local child = real .. "/" .. tostring(f.name)
+    local name = tostring(f.name)
+    if hidden or name:sub(1, 1) ~= "." then
+      out[#out + 1] = { real = child, depth = depth, name = name }
+      local linked = (f.lstat and (f.lstat.is_link or f.lstat.is_indirect)) or (f.stat and (f.stat.is_link or f.stat.is_indirect))
+      if f.stat and f.stat.is_dir and not linked and expanded[child] then
+        walk(child, depth + 1, expanded, out, hidden, order)
+      end
+    end
+  end
+  return out
 end
 
--- Re-key every expanded directory inside the moved subtree of a single
--- `from_str -> to_str` rename, comparing cwd-relative paths so `alpha/bc` is
--- never rewritten by a rename of `alpha/b`. A move out of the tree root prunes
--- the subtree instead, since those keys can never be reachable again. Returns
--- true when a key moved or was pruned.
-local function remap_expanded_prefix(from_str, to_str)
-	local cwd = cx.active.current.cwd
-	local from_rel = rel_of(from_str)
-	if not from_rel or from_rel == "" then
-		return false
-	end
-	local to_rel = rel_of(to_str)
-	local from_prefix = from_rel .. "/"
-	local updates = {}
-	for u in pairs(M.expanded) do
-		local rel = rel_of(u)
-		if rel then
-			local suffix
-			if rel == from_rel then
-				suffix = ""
-			elseif rel:sub(1, #from_prefix) == from_prefix then
-				suffix = rel:sub(#from_prefix + 1)
-			end
-			if suffix then
-				local new_url
-				if to_rel and to_rel ~= "" and to_rel ~= from_rel then
-					local new_rel = suffix == "" and to_rel or (to_rel .. "/" .. suffix)
-					new_url = tostring(cwd:join(new_rel))
-				end
-				updates[#updates + 1] = { old = u, new = new_url }
-			end
-		end
-	end
-	for _, pair in ipairs(updates) do
-		M.expanded[pair.old] = nil
-		if pair.new then
-			M.expanded[pair.new] = true
-		end
-	end
-	return #updates > 0
+function M:provide(job)
+  local op = job.op
+  if op == "Capabilities" then
+    return { file = 1, read_dir = 1, revalidate = 1 }
+  elseif op == "ReadDir" then
+    local folder = job.url                        -- view portal
+    local root = tostring(folder.physical)        -- real cwd/root
+    local data = folder.spec.data or {}
+    local paths, query, order = read_provider_state(data.tab, root)
+    local expanded = {}; for _, path in ipairs(paths) do expanded[path] = true end
+    local flat = walk(root, 0, expanded, {}, rt.mgr.show_hidden, order)
+    if query and query ~= "" then
+      local lower = query:lower()
+      local keep = {}
+      for i = #flat, 1, -1 do
+        local e = flat[i]
+        local match = (query:find("%u") and e.name:find(query, 1, true)) or (not query:find("%u") and e.name:lower():find(lower, 1, true))
+        if match then keep[e.real] = true end
+        local parent = e.real:match("^(.*)/[^/]+$")
+        if keep[e.real] and parent then keep[parent] = true end
+        if keep[e.real] or match then e.keep = true end
+      end
+      local filtered = {}
+      for _, e in ipairs(flat) do
+        if e.keep or keep[e.real] then filtered[#filtered + 1] = e end
+      end
+      flat = filtered
+    end
+    local names = {}
+    for i, e in ipairs(flat) do names[i] = e.real end
+    ya.dbg("[tvfs] ReadDir tab=" .. tostring(data.tab) .. " root=" .. root .. " entries " .. #flat .. " :: " .. table.concat(names, " "))
+    return ya.co(function()
+      for _, e in ipairs(flat) do
+        local rel = e.real:sub(#root + 2)
+        local file, err = file_from_url(folder:join(rel))
+        if not file then return nil, err end
+        coroutine.yield(file)
+      end
+    end)
+  elseif op == "File" then
+    ya.dbg("[tvfs] File " .. tostring(job.url.physical))
+    return file_from_url(job.url)
+  elseif op == "Revalidate" then
+    ya.dbg("[tvfs] Revalidate " .. tostring(job.file.url.physical))
+    return file_from_url(job.file.url)            -- always a File => forces re-read on refresh
+  end
+  return false, Err("Unsupported tree-vfs operation: %s", op)
 end
 
--- Sync-side application of a plugin-owned nested rename. The async input task
--- cannot touch M or cx, so it hands both the old and the resolved new URL back
--- here to re-key the expansion subtree (a renamed directory must keep its
--- expanded descendants), then bump the generation and coalesce one controlled
--- rebuild, keeping the current root.
-local apply_nested_rename = ya.sync(function(_, old_str, new_str)
-	local remapped = remap_expanded_prefix(old_str, new_str)
-	local saved_touched = remap_saved(old_str, new_str)
-	ya.dbg(
-		"[tree-dbg] nested rename applied; old=",
-		old_str,
-		"new=",
-		new_str,
-		"remapped=",
-		tostring(remapped),
-		"saved=",
-		tostring(saved_touched)
-	)
-	M.gen = M.gen + 1
-	M.pending_focus = new_str
-	ui.render()
-	rebuild(M.gen, new_str)
+local snapshot = ya.sync(function()
+  local cur = cx.active.current
+  local h = cur.hovered
+  return {
+    cwd = tostring(cur.cwd.physical or cur.cwd),
+    cwd_url = tostring(cur.cwd),
+    tab = tonumber(cx.active.id.value) or tostring(cx.active.id),
+    hovered = h and tostring(h.url.physical) or nil,
+    hovered_is_dir = h and h.stat and h.stat.is_dir or false,
+    hovered_is_link = h and ((h.stat and h.stat.is_link) or (h.lstat and h.lstat.is_link)) or false,
+    hovered_is_indirect = h and ((h.stat and h.stat.is_indirect) or (h.lstat and h.lstat.is_indirect)) or false,
+    parent = h and h.url.parent and tostring(h.url.parent.physical) or nil,
+    filter = cur.cwd.spec and cur.cwd.spec.data and cur.cwd.spec.data.filter,
+    is_tree = cur.cwd.spec and cur.cwd.spec.is_view and cur.cwd.spec.scheme == "tree" and cur.cwd.spec.domain == DOMAIN,
+  }
 end)
 
--- ---------------------------------------------------------------------------
--- Deletion (stock trash / permanent delete). Native remove already targets the
--- selected-or-hovered URLs at any depth and keeps its confirmation, task, and
--- selection behavior; the plugin only reacts to the successful completion
--- events to prune the controlled hierarchy and rebuild once.
--- ---------------------------------------------------------------------------
-
--- Forget every M.rows entry for `target_str` or inside its subtree, with the
--- same cwd-relative, path-boundary-safe comparison as prune_expanded.
-local function prune_rows(target_str)
-	local cwd = cx.active.current.cwd
-	local target_rel = tostring(Url(target_str):strip_prefix(cwd) or "")
-	if target_rel == "" then
-		return false
-	end
-	local prefix = target_rel .. "/"
-	local removed = false
-	for u in pairs(M.rows) do
-		local rel = tostring(Url(u):strip_prefix(cwd) or "")
-		if rel == target_rel or rel:sub(1, #prefix) == prefix then
-			M.rows[u] = nil
-			removed = true
-		end
-	end
-	return removed
-end
-
--- ---------------------------------------------------------------------------
--- Mutation-event domain controller. events.lua owns the rename/remove/transfer
--- reconciliation policy; every read and write of M stays in main.lua behind
--- these bounded operations, so the module never holds the state table.
--- ---------------------------------------------------------------------------
-
--- True when `url_str` is the active tree root or an expanded directory: the two
--- places where a created/removed/transferred child becomes a visible row.
-local function is_tree_parent(url_str)
-	return url_str == tostring(cx.active.current.cwd) or M.expanded[url_str]
-end
-
--- Snapshot of the controlled expansion keys. The module rebuilds whole sets, so
--- it reads a plain list and hands the replacement back through commit_mutation.
-local function expanded_keys()
-	local out = {}
-	for url_str in pairs(M.expanded) do
-		out[#out + 1] = url_str
-	end
-	return out
-end
-
--- Snapshot of the depth-0 URL order (nil when the plugin has none yet).
-local function root_order_snapshot()
-	local order = M.root_order
-	if not order then
-		return nil
-	end
-	local out = {}
-	for i, url_str in ipairs(order) do
-		out[i] = url_str
-	end
-	return out
-end
-
--- Prune the controlled hierarchy for every removed root and report how many
--- expansion keys and visible-row entries were dropped.
-local function prune_for_removal(roots)
-	local pruned_expanded, pruned_rows = 0, 0
-	for _, u_str in ipairs(roots) do
-		if prune_expanded(u_str) then
-			pruned_expanded = pruned_expanded + 1
-		end
-		if prune_rows(u_str) then
-			pruned_rows = pruned_rows + 1
-		end
-	end
-	return pruned_expanded, pruned_rows
-end
-
--- Single commit for every mutation handler: install the replacement sets when
--- the module computed them, bump the generation, request the focus, then redraw
--- and coalesce one controlled rebuild. Preserves the existing update order.
-local function commit_mutation(focus, new_expanded, new_root_order)
-	if new_expanded then
-		M.expanded = new_expanded
-	end
-	if new_root_order then
-		M.root_order = new_root_order
-	end
-	M.gen = M.gen + 1
-	M.pending_focus = focus
-	ui.render()
-	rebuild(M.gen, focus)
-end
-
--- r: tree-aware rename. Outside tree mode, for a depth-0 row, or with a native
--- multi-selection this delegates to stock rename (which routes selections to
--- bulk rename, already remapped by the events module). Delegation forwards the
--- stock preset binding's `cursor = "before_ext"` so caret placement there is
--- unchanged. A single injected descendant at any depth is renamed beside its
--- parent by the plugin, without stock `reveal` rerooting the tab onto the child
--- path; its caret reproduces `before_ext` by opening a realtime input and
--- emitting the input layer's own `move` offset. Casefold handling remains the
--- only stock capability the plugin-owned path cannot run.
-function M:rename()
-	if not active_tree() then
-		ya.emit("rename", { cursor = "before_ext" })
-		return
-	end
-
-	local h = hovered()
-	if not h then
-		ya.emit("rename", { cursor = "before_ext" })
-		return
-	end
-
-	-- Stock rename hands any non-empty selection to bulk rename.
-	if #cx.active.selected > 0 then
-		ya.emit("rename", { cursor = "before_ext" })
-		return
-	end
-
-	-- Root rows keep stock behavior (with the forwarded `before_ext` cursor
-	-- placement and stock casefold handling). Only injected descendants
-	-- (relative path has a slash) need the plugin-owned path.
-	if not relative_of(h):find("/", 1, true) then
-		ya.emit("rename", { cursor = "before_ext" })
-		return
-	end
-
-	local old_url_str = tostring(h.url)
-	local name = h.name and tostring(h.name) or ""
-	local move = before_ext_move(name, is_regular(h.cha))
-	ya.dbg("[tree-dbg] nested rename open; old=", old_url_str, "move=", tostring(move))
-
-	ya.async(function()
-		if not operations then
-			require("tree.operations") -- async context: safe here
-			-- Raw module table: plain call, no require-proxy wrapper.
-			operations = package.loaded["tree.operations"]
-		end
-		operations.nested_rename({
-			old_url_str = old_url_str,
-			name = name,
-			move = move,
-			apply_nested_rename = apply_nested_rename,
-		})
-	end)
-end
-
--- l: expand a hovered safe directory at any depth; no-op on files and on
--- symlinked/indirect directories (cycle guard).
-function M:right()
-	if not active_tree() then
-		ya.emit("enter", {})
-		return
-	end
-
-	local h = hovered()
-	if not h then
-		return
-	end
-	if not h.cha.is_dir then
-		return
-	end
-	if h.cha.is_link or h.cha.is_indirect then
-		ya.dbg("[tree-dbg] refusing to expand linked directory; url=", tostring(h.url))
-		return
-	end
-
-	local url_str = tostring(h.url)
-	if M.expanded[url_str] then
-		return
-	end
-
-	M.expanded[url_str] = true
-	M.gen = M.gen + 1
-	ya.dbg("[tree-dbg] expand ", url_str)
-	ui.render()
-	rebuild(M.gen, url_str)
-end
-
--- h: collapse the hovered expanded directory, or the immediate parent of a
--- nested row, pruning the whole subtree and focusing the collapsed directory.
--- Never leaves the cwd.
-function M:left()
-	if not active_tree() then
-		ya.emit("leave", {})
-		return
-	end
-
-	local h = hovered()
-	if not h then
-		return
-	end
-
-	local target
-	local url_str = tostring(h.url)
-	if h.cha and h.cha.is_dir and M.expanded[url_str] then
-		target = url_str
-	else
-		local meta = M.rows[url_str]
-		if meta and meta.parent then
-			target = meta.parent
-		else
-			local rs = relative_of(h)
-			if not rs:find("/", 1, true) then
-				return
-			end
-			local parent_rel = rs:match("^(.*)/[^/]*$")
-			if not parent_rel or parent_rel == "" then
-				return
-			end
-			target = tostring(cx.active.current.cwd:join(parent_rel))
-		end
-	end
-
-	if not target or not M.expanded[target] then
-		return
-	end
-
-	prune_expanded(target)
-	M.gen = M.gen + 1
-	ya.dbg("[tree-dbg] collapse ", target)
-	ui.render()
-	rebuild(M.gen, target)
-end
-
--- H: reroot the tree one directory up (the parent of the current tree root).
--- No-op at the filesystem root; outside tree mode this is stock history back.
-function M:root_up()
-	if not active_tree() then
-		ya.emit("back", {})
-		return
-	end
-	local parent = cx.active.current.cwd.parent
-	if not parent then
-		ya.dbg("[tree-dbg] root_up at filesystem root; no-op")
-		return
-	end
-	ya.dbg("[tree-dbg] root_up -> ", tostring(parent))
-	ya.emit("cd", { parent })
-end
-
--- L: reroot into a hovered directory (any depth); reveal a nested file in its
--- containing directory (cd + hover, one action); open a root-level file
--- normally. Outside tree mode this is stock history forward.
-function M:root_down()
-	if not active_tree() then
-		ya.emit("forward", {})
-		return
-	end
-	local h = hovered()
-	if not h then
-		return
-	end
-	if h.cha and h.cha.is_dir then
-		ya.dbg("[tree-dbg] root_down dir -> ", tostring(h.url))
-		ya.emit("cd", { h.url })
-		return
-	end
-	if relative_of(h):find("/", 1, true) then
-		ya.dbg("[tree-dbg] root_down reveal -> ", tostring(h.url))
-		ya.emit("reveal", { h.url })
-	else
-		ya.emit("open", {})
-	end
-end
-
--- ---------------------------------------------------------------------------
--- Target-aware create. Stock create always joins the typed name to the active
--- cwd and then reveals (a cd whenever the target parent differs from cwd), so a
--- hovered directory or injected child cannot be delegated to it. The plugin
--- reproduces the prompt and filesystem work without ever changing cwd, then
--- rebuilds the expanded hierarchy so the new row is injected in place.
--- ---------------------------------------------------------------------------
-
--- Sync-side completion: only rebuild when the root is unchanged and the target
--- is part of the injected hierarchy (or rows are already injected), so a
--- watcher-driven Full reload cannot leave injected rows stale.
-local create_after = ya.sync(function(_, cwd_str, target_str, joined_str)
-	if tostring(cx.active.current.cwd) ~= cwd_str then
-		ya.dbg("[tree-dbg] create finished after reroot; skipping rebuild")
-		return
-	end
-	if M.expanded[target_str] or M.injected or M.injecting then
-		M.gen = M.gen + 1
-		M.pending_focus = joined_str
-		ui.render()
-		rebuild(M.gen, joined_str)
-	else
-		ya.dbg("[tree-dbg] create target not injected; no rebuild")
-	end
+-- Yanked files + a target-aware paste destination. The destination is the
+-- hovered directory, else the hovered file's parent, else the view portal.
+local yank_snapshot = ya.sync(function()
+  local items = {}
+  for _, f in pairs(cx.yanked) do
+    items[#items + 1] = { url = f.url, name = tostring(f.name) }
+  end
+  local h = cx.active.current.hovered
+  local dest = cx.active.current.cwd
+  if h then
+    if h.stat and h.stat.is_dir then
+      dest = h.url
+    elseif h.url.parent then
+      dest = h.url.parent
+    end
+  end
+  return {
+    cut = cx.yanked.is_cut,
+    items = items,
+    dest = dest,
+    selected = #cx.active.selected,
+  }
 end)
 
--- a: create at the hovered tree level. Outside tree mode, with no hover, or
--- when the resolved destination is the tree root, delegate to stock create
--- (which is byte-for-byte what is wanted there). A trailing path separator
--- selects directory creation; an existing file asks before being replaced.
-function M:create(args)
-	args = args or {}
-	local force = args.force == true
-
-	if not active_tree() then
-		ya.emit("create", { force = force })
-		return
-	end
-
-	local h = hovered()
-	if not h then
-		ya.emit("create", { force = force })
-		return
-	end
-
-	local target = h.cha and h.cha.is_dir and h.url or h.url.parent
-	if not target then
-		ya.emit("create", { force = force })
-		return
-	end
-
-	local cwd_str = tostring(cx.active.current.cwd)
-	local target_str = tostring(target)
-	if target_str == cwd_str then
-		ya.emit("create", { force = force })
-		return
-	end
-
-	ya.dbg("[tree-dbg] create target=", target_str, " force=", tostring(force))
-	ya.async(function()
-		if not operations then
-			require("tree.operations") -- async context: safe here
-			-- Raw module table: plain call, no require-proxy wrapper.
-			operations = package.loaded["tree.operations"]
-		end
-		operations.create({
-			force = force,
-			target_str = target_str,
-			cwd_str = cwd_str,
-			create_after = create_after,
-		})
-	end)
-end
-
--- ---------------------------------------------------------------------------
--- Target-aware paste. Native yank/cut already work on injected rows, so only
--- the destination needs redirecting. Stock paste always uses tab.cwd(), so a
--- non-cwd destination reproduces it through Yazi's own copy/move tasks; the
--- scheduler keeps unique-name/force behavior, task progress, hooks, watcher
--- reports, and duplicate/move DDS events identical to stock.
--- ---------------------------------------------------------------------------
-
--- p / P: paste into the hovered tree level. A cwd destination (root-level file,
--- or no hover) delegates to stock paste for exact parity; otherwise every
--- yanked source is spawned as one native copy/move task. Cut clears the yank
--- set and the stale active selection, matching stock's visible bookkeeping.
-function M:paste(args)
-	args = args or {}
-	local force = args.force == true
-	local follow = args.follow == true
-
-	if not active_tree() then
-		ya.emit("paste", { force = force, follow = follow })
-		return
-	end
-
-	local h = hovered()
-	local cwd_str = tostring(cx.active.current.cwd)
-	local dest = h and (h.cha and h.cha.is_dir and h.url or h.url.parent) or nil
-	if not dest or tostring(dest) == cwd_str then
-		ya.emit("paste", { force = force, follow = follow })
-		return
-	end
-
-	local cut = cx.yanked.is_cut
-	local items = {}
-	for _, f in pairs(cx.yanked) do
-		if f.name then
-			items[#items + 1] = { from = tostring(f.url), name = tostring(f.name) }
-		end
-	end
-
-	local dest_str = tostring(dest)
-	ya.dbg(
-		"[tree-dbg] paste force=",
-		tostring(force),
-		"cut=",
-		tostring(cut),
-		"dest=",
-		dest_str,
-		"items=",
-		#items
-	)
-	if #items == 0 then
-		return
-	end
-	-- Mirrors stock paste: reset task tracing so a successful first task reveals
-	-- its result, then spawn one task per source.
-	cx.tasks.behavior:reset()
-	ya.async(function()
-		for _, it in ipairs(items) do
-			local from = Url(it.from)
-			local to = Url(dest_str):join(it.name)
-			if force and tostring(from) == tostring(to) then
-				ya.dbg("[tree-dbg] paste skipping identical forced endpoint; url=", it.from)
-			else
-				local ok, err = pcall(function()
-					if cut then
-						ya.task("move", { from = from, to = to, force = force }):spawn()
-					else
-						ya.task("copy", { from = from, to = to, force = force, follow = follow }):spawn()
-					end
-				end)
-				if not ok then
-					ya.dbg("[tree-dbg] paste spawn failed; from=", it.from, " err=", tostring(err))
-					ya.notify({ title = "Paste failed", content = tostring(err), level = "error", timeout = 3 })
-				end
-			end
-		end
-	end)
-
-	if cut then
-		ya.dbg("[tree-dbg] cut paste unyank")
-		ya.emit("unyank", {})
-		if #cx.active.selected > 0 then
-			ya.emit("escape", { select = true })
-		end
-	end
-end
-
--- Enter: in tree mode a hovered directory reroots (native enter), a file opens
--- normally; outside tree mode this is exactly the stock open action.
-function M:open()
-	if active_tree() then
-		local h = hovered()
-		if h and h.cha.is_dir then
-			ya.emit("enter", {})
-			return
-		end
-	end
-	ya.emit("open", {})
-end
-
--- Emitted by a completed rebuild to place the cursor on the anchor row.
--- M.pending_focus is either one URL string or an ordered candidate list (used by
--- removal focus so a fallback hidden by the active tree filter is skipped).
-function M:focus()
-	local focus = M.pending_focus
-	M.pending_focus = nil
-	if not focus then
-		return
-	end
-
-	local candidates
-	if type(focus) == "table" then
-		candidates = focus
-	else
-		candidates = { focus }
-	end
-
-	local folder = cx.active.current
-	local files = folder.files
-	local cursor = folder.cursor or 0
-	local index = {}
-	for i = 1, #files do
-		index[tostring(files[i].url)] = i
-	end
-	for _, url_str in ipairs(candidates) do
-		local i = index[url_str]
-		if i then
-			local delta = (i - 1) - cursor
-			if delta ~= 0 then
-				ya.emit("arrow", { step = delta })
-			end
-			return
-		end
-	end
-end
-
--- ---------------------------------------------------------------------------
--- Tree-aware filtering. Yazi's native filter has no event or preflight hook and
--- matches the full urn, so it cannot keep injected descendants attached to
--- their parents. The plugin owns the query instead: it rebuilds the real
--- Entries subset (Yazi's own `entries.filter` stays nil) so rendered rows,
--- Folder cursor, hover, selection, and operations stay aligned.
--- ---------------------------------------------------------------------------
-
--- Rebuild after an event-free external change (hidden toggle, realtime filter).
-function M:reassert()
-	if not active_tree() then
-		return
-	end
-	M.gen = M.gen + 1
-
-	local h = hovered()
-	local focus
-	if h then
-		local rs = relative_of(h)
-		if M.filter_query and rs:find("/", 1, true) then
-			local root = rs:match("^([^/]+)")
-			focus = root and tostring(cx.active.current.cwd:join(root)) or tostring(h.url)
-		else
-			focus = tostring(h.url)
-		end
-	end
-
-	ui.render()
-	rebuild(M.gen, focus)
-end
-
--- f: in tree mode collect a realtime query and rebuild the visible subset;
--- outside tree mode delegate to the stock `filter --smart` behavior.
-function M:filter()
-	if not active_tree() then
-		ya.emit("filter", { smart = true })
-		return
-	end
-
-	local initial = ""
-	ya.dbg("[tree-dbg] filter input opened")
-	ya.async(function()
-		-- Stock popup parity: the input always opens blank (value defaults to
-		-- ""), with the shared filter history, and opening emits no filter
-		-- change. An existing hierarchy-aware query therefore stays applied
-		-- until the first realtime typed value replaces it, exactly like
-		-- Yazi's native `filter` popup over a live native filter.
-		local stream = ya.input({
-			name = "filter",
-			title = "Filter: ",
-			history = "shared",
-			value = initial,
-			-- Match Yazi's stock filter popup (top-center, offset [0, 2, 50, 3]);
-			-- omitting `pos` leaves the popup zero-width and invisible.
-			pos = { "top-center", y = 2, w = 50 },
-			realtime = true,
-			debounce = 0.05,
-		})
-		while true do
-			local value, event = stream:recv()
-			-- 1=submit, 3=type; 2=cancel, 0=end.
-			if event == 1 or event == 3 then
-				set_filter_query((value ~= nil and value ~= "") and value or nil)
-				ya.emit("plugin", { "tree", "reassert" })
-			end
-			-- Cancel/Escape is ignored, like stock's Filter actor: it closes the
-			-- popup and keeps the latest live-applied query without reverting or
-			-- clearing it. Submitting a blank value still clears (stock Submit
-			-- runs filter_do with an empty query).
-			if event == 0 or event == 1 or event == 2 then
-				break
-			end
-		end
-	end)
-end
-
--- <Esc>: clear an active tree filter and restore the full hierarchy; otherwise
--- fall through to Yazi's stock escape cascade.
-function M:escape()
-	if active_tree() and M.filter_query then
-		M.filter_query = nil
-		M.gen = M.gen + 1
-		local h = hovered()
-		ya.dbg("[tree-dbg] filter cleared")
-		ui.render()
-		rebuild(M.gen, h and tostring(h.url) or nil)
-		return
-	end
-	ya.emit("escape", {})
-end
-
--- ---------------------------------------------------------------------------
--- cwd/root change: save the outgoing root's live state and restore the incoming
--- root's saved state (or an empty one), then make rows and state agree.
--- ---------------------------------------------------------------------------
-
--- Seed a newly observed tab. Tabs created by tab_create inherit the creating
--- tab's tree/preview modes (and its configured sort, because Yazi cloned the
--- creator's pref including a pinned sort_by=none). Boot tabs the plugin sees for
--- the first time start from the configured startup defaults.
-local function ensure_tab(id, creator)
-	if not id then
-		return nil
-	end
-	local t = M.tabs[id]
-	if t then
-		return t
-	end
-	t = { tree = false, preview = true, root = nil, roots = {} }
-	if creator then
-		t.tree, t.preview = creator.tree, creator.preview
-		if creator.tree and creator.sort_saved then
-			t.sort_saved = copy_sort(creator.sort_saved)
-		end
-	else
-		t.tree = startup_defaults.tree
-		t.preview = startup_defaults.preview
-	end
-	M.tabs[id] = t
-	return t
-end
-
--- Drop per-tab state for tabs Yazi has closed. 26.9.1 has no close/quit event
--- and Tabs::set_idx publishes `tab` even when the active id is unchanged, so
--- this must run before any same-id early return. Tab ids are never reused, so
--- dropping the state is safe.
-local function prune_tabs()
-	local live = {}
-	for i = 1, #cx.tabs do
-		live[id_num(cx.tabs[i].id)] = true
-	end
-	for id in pairs(M.tabs) do
-		if not live[id] then
-			M.tabs[id] = nil
-			ya.dbg("[tree-dbg] pruned closed tab=", id)
-		end
-	end
-end
-
--- Activate `tab`: save the outgoing tab's live state, invalidate any in-flight
--- rebuild, seed/load the incoming tab, apply its own ratio, and reconcile its
--- root. reconcile_root runs even for a classic incoming tab, so injected rows
--- restored from that tab's cached Folder are stripped and can never render as
--- flat classic rows.
-local function activate(tab)
-	local old = M.active_tab
-	local old_t = old and M.tabs[old] or nil
-	if old_t then
-		save_live(old)
-		if is_idle(old_t) then
-			capture_base()
-		end
-	end
-
-	M.gen = M.gen + 1
-	M.active_tab = tab
-	local t = ensure_tab(tab, old_t)
-	if not t then
-		return
-	end
-	local root = tostring(cx.active.current.cwd)
-	t.root = root
-	M.pending_focus, M.injected, M.injecting = nil, false, false
-	if t.tree then
-		pin_sort_for(t)
-	else
-		restore_sort_for(t)
-	end
-	load_roots(t, root)
-	apply_active()
-	reconcile_root()
-	prune_tabs()
-end
-
-local function on_cd(payload)
-	local tab = id_num(payload and payload.tab)
-	if not tab then
-		return
-	end
-	-- Boot tabs the plugin has never seen are seeded with startup defaults; a
-	-- new tab created by tab_create was already seeded (with inheritance) by the
-	-- `tab` handler before this cd was processed.
-	local t = ensure_tab(tab)
-	if not t then
-		return
-	end
-	-- The local `cd` ember carries only the tab id (its url field is the owned
-	-- dummy), but the Folder swap has already happened by the time local
-	-- subscribers run, so the live cwd is the incoming root.
-	if tab ~= active_id() then
-		-- A background tab rerooted (task/plugin-driven; no stock key does this).
-		-- Never touch the live state being rendered for the active tab, but do
-		-- keep that tab's own bookkeeping current: record its new root and drop
-		-- the suspended native query, which belonged to the folder it just left,
-		-- mirroring the active-tab reset below.
-		local bg_root = tab_cwd(tab)
-		if bg_root then
-			t.root = bg_root
-		end
-		t.suspended_filter = nil
-		ya.dbg("[tree-dbg] cd background tab=", tab, " root=", tostring(bg_root))
-		return
-	end
-	local root = tostring(cx.active.current.cwd)
-	if M.active_tab == nil then
-		ya.dbg("[tree-dbg] cd bootstrap tab=", tab, " root=", root)
-	end
-	if M.active_tab == tab and root == t.root then
-		-- tab_create's queued `tab` handler already activated and reconciled
-		-- this root.
-		return
-	end
-
-	-- save_live still sees the outgoing root here: Yazi's Folder swap does not
-	-- touch Lua state and on_cd is the first callback after it.
-	if t.tree then
-		save_live(tab)
-	end
-	M.gen = M.gen + 1
-	M.active_tab = tab
-	t.root = root
-	-- Never restore a saved native query across a cd/reroot: it belongs to the
-	-- folder that owned it, and the new Folder may carry its own filter.
-	t.suspended_filter = nil
-	load_roots(t, root)
-	M.pending_focus, M.injected, M.injecting = nil, false, false
-	ya.dbg(
-		"[tree-dbg] cd restore; tab=",
-		tab,
-		" root=",
-		root,
-		" saved=",
-		tostring(t.roots[root] ~= nil),
-		" expanded=",
-		tostring(next(M.expanded) ~= nil)
-	)
-	reconcile_root()
-end
-
--- Tab switch/create. The live M.* describes only the previously active tab, so
--- save it, then restore the incoming tab's own state. prune_tabs runs first
--- because set_idx publishes even when the active id is unchanged (a closed
--- background tab must still be forgotten).
-local function on_tab(payload)
-	local tab = id_num(payload and payload.idx)
-	if not tab then
-		return
-	end
-	prune_tabs()
-	if tab == M.active_tab then
-		-- Same-id publication (for example closing a background tab). Reconcile
-		-- only if the active folder moved without a matching cd.
-		local t = M.tabs[tab]
-		if t and t.root ~= tostring(cx.active.current.cwd) then
-			activate(tab)
-		end
-		return
-	end
-	ya.dbg("[tree-dbg] tab switch; tab=", tab)
-	activate(tab)
-end
-
--- ---------------------------------------------------------------------------
--- Lifecycle
--- ---------------------------------------------------------------------------
+local quit_snapshot = ya.sync(function()
+  return {
+    physical = tostring(cx.active.current.cwd.physical or cx.active.current.cwd),
+  }
+end)
+local reset_tasks = ya.sync(function() cx.tasks.behavior:reset() end)
+local layout_update = ya.sync(function(state, tab_id, action, tree_default, preview_default)
+  local id = tostring(tab_id or cx.active.id)
+  state.tabs[id] = state.tabs[id] or { roots = {} }
+  local tab = state.tabs[id]
+  if tab.tree_mode == nil then tab.tree_mode = tree_default == true end
+  if tab.preview_mode == nil then tab.preview_mode = preview_default ~= false end
+  if action == "toggle_tree" then tab.tree_mode = not tab.tree_mode
+  elseif action == "toggle_preview" then tab.preview_mode = not tab.preview_mode
+  elseif action == "tree" then tab.tree_mode = tree_default == true end
+  local base = state.base_ratio or { 1, 3, 4 }
+  local ratio = { base[1], base[2], base[3] }
+  if tab.tree_mode then ratio[1] = 0 end
+  if not tab.preview_mode then ratio[3] = 0 end
+  rt.mgr.ratio = ratio
+  ya.emit("app:resize", {})
+  ya.dbg(string.format("[tvfs] ratio %d,%d,%d", ratio[1], ratio[2], ratio[3]))
+  return tab.tree_mode, tab.preview_mode
+end)
+local begin_navigation = ya.sync(function(state, tab_id)
+  state.navigation = state.navigation or {}
+  local key = tostring(tab_id)
+  state.navigation[key] = (state.navigation[key] or 0) + 1
+  return state.navigation[key]
+end)
+local arm_reveal = ya.sync(function(state, tab_id, sequence, root, origin, focus, filter)
+  state.pending_reveal = { tab = tostring(tab_id), sequence = sequence, root = root, origin = origin, focus = focus, filter = filter }
+end)
 
 function M:setup(opts)
-	opts = opts or {}
-
-	if not render then
-		require(".render") -- runs in init.lua's async context
-		-- Raw module table: plain sync functions, no per-row require proxy.
-		render = package.loaded["tree.render"]
-	end
-	render.configure(opts)
-
-	if opts.filter_mode == "suspend" or opts.filter_mode == "clear" then
-		filter_mode = opts.filter_mode
-	else
-		filter_mode = "adopt"
-	end
-	ya.dbg("[tree-dbg] setup; style=", render.style(), " filter_mode=", filter_mode)
-
-	if
-		render.install({
-			saved = Current.redraw,
-			active_tree = active_tree,
-			relative_depth = relative_depth,
-			rows = function()
-				return M.rows
-			end,
-			expanded = function()
-				return M.expanded
-			end,
-		})
-	then
-		Current.redraw = render.redraw
-	end
-
-	install_header_filter()
-
-	-- Capture the configured base ratio once, before any startup state mutates
-	-- what effective_ratio() composes from.
-	if not base then
-		capture_base()
-	end
-
-	-- Save/restore per-tab/per-root expansion state whenever the root changes.
-	-- Registered once.
-	if not cd_subscribed then
-		cd_subscribed = true
-		ps.sub("cd", on_cd)
-	end
-
-	-- Isolate saved roots by tab: switching or creating a tab restores that
-	-- tab's own state instead of leaking the previous tab's hierarchy in.
-	if not tab_subscribed then
-		tab_subscribed = true
-		ps.sub("tab", on_tab)
-	end
-
-	-- Setup-installed mutation event reconciliation. events.lua owns the
-	-- rename/bulk-rename and remove/transfer policy; the bounded controller
-	-- keeps every read and write of M in main.lua.
-	if not events then
-		require(".events") -- runs in init.lua's async context
-		-- Raw module table: plain sync handlers, no per-event require proxy.
-		events = package.loaded["tree.events"]
-	end
-	local mutation = events.bind({
-		active_tree = active_tree,
-		hovered = hovered,
-		rel_of = rel_of,
-		cwd = function()
-			return cx.active.current.cwd
-		end,
-		is_tree_parent = is_tree_parent,
-		count_keys_tabs = function()
-			return count_keys(M.tabs)
-		end,
-		remap_saved = remap_saved,
-		remap_saved_bulk = remap_saved_bulk,
-		remap_expanded_prefix = remap_expanded_prefix,
-		expanded_keys = expanded_keys,
-		root_order = root_order_snapshot,
-		prune_saved = prune_saved,
-		prune_for_removal = prune_for_removal,
-		commit_mutation = commit_mutation,
-	})
-
-	-- Remap/rebuild the injected hierarchy when rows are renamed.
-	if not mutate_subscribed then
-		mutate_subscribed = true
-		ps.sub("rename", mutation.on_rename)
-		ps.sub("bulk-rename", mutation.on_bulk_rename)
-	end
-
-	-- Sort is transformed and hidden changes are re-asserted after the actor,
-	-- because the injected flat list must keep its controlled ordering.
-	if not preflight_subscribed then
-		preflight_subscribed = true
-		ps.sub("key-sort", on_key_sort)
-		ps.sub("key-hidden", on_key_hidden)
-	end
-
-	-- Successful copy/move completion: refresh the affected injected branches.
-	if not transfer_subscribed then
-		transfer_subscribed = true
-		ps.sub("duplicate", mutation.on_transfer("duplicate"))
-		ps.sub("move", mutation.on_transfer("move"))
-	end
-
-	-- Successful trash/permanent-delete completion: prune every removed URL
-	-- and subtree from the controlled hierarchy and coalesce one rebuild.
-	if not remove_subscribed then
-		remove_subscribed = true
-		ps.sub("trash", mutation.on_remove("trash"))
-		ps.sub("delete", mutation.on_remove("delete"))
-	end
-
-	-- Optional per-launch startup state. setup() runs during init.lua, before
-	-- Yazi's bootstrap reflow and first paint, so assigning rt.mgr.ratio here
-	-- makes the very first frame tree-shaped. app:resize/ui.render are not
-	-- needed on this path (and app:resize would only be drained afterwards).
-	local startup = opts.startup
-	if startup ~= nil then
-		startup_defaults = {
-			tree = startup.tree == true,
-			preview = startup.preview ~= false,
-		}
-		render.reset_logs()
-		ya.dbg(
-			"[tree-dbg] startup tree=",
-			tostring(startup_defaults.tree),
-			"preview=",
-			tostring(startup_defaults.preview)
-		)
-		rt.mgr.ratio = effective_ratio(startup_defaults)
-	end
-end
-
-function M:toggle()
-	M.active_tab = M.active_tab or active_id()
-	local t = ensure_tab(M.active_tab)
-	if not t then
-		return
-	end
-	sync_base()
-	if render then
-		render.reset_logs()
-	end
-
-	if t.tree then
-		-- Turning tree mode OFF for this tab only. Collapse everything by
-		-- re-injecting the root entries only, then hand this tab's Folder
-		-- ordering back to its configured sort. Cleanup is required whenever
-		-- descendants may exist OR a rebuild is still in flight: collapsing the
-		-- last expanded directory records `injected = false` only after its
-		-- async rebuild completes, so gating on that flag alone can skip
-		-- cleanup and leave stale descendant rows in the folder.
-		local restoring = M.filter_query
-		local had_work = M.injected or M.injecting or t.sort_saved ~= nil or has_descendants()
-		-- Preserve this tab/root's hierarchy in its own roots map before the
-		-- live state is cleared, so re-enabling tree mode can restore it.
-		-- Classic tabs keep live state empty and their roots map frozen.
-		t.root = tostring(cx.active.current.cwd)
-		save_live(M.active_tab)
-		t.tree = false
-		M.gen = M.gen + 1
-		M.expanded = {}
-		M.rows = {}
-		M.injected = false
-		M.injecting = false
-		M.pending_focus = nil
-		M.root_order = nil
-		M.filter_query = nil
-		ya.dbg(
-			"[tree-dbg] toggle off; tab=",
-			M.active_tab,
-			" saved_roots=",
-			count_keys(t.roots),
-			" work=",
-			tostring(had_work)
-		)
-		if had_work then
-			rebuild(M.gen, nil, false)
-		end
-		restore_sort_for(t)
-		-- Hand native filtering back only after the root rows are re-injected,
-		-- so the restored query is applied to the real folder contents. cd and
-		-- other reroot paths reset without restoring (see on_cd).
-		restore_native_filter(restoring)
-	else
-		-- Entering tree mode for this tab: restore this tab/root's saved
-		-- expansions and root order, then take ownership of any native filter
-		-- before the first injection. Native filter changes made while tree
-		-- mode was off stay authoritative; the restored hierarchy is root-local.
-		t.tree = true
-		t.root = tostring(cx.active.current.cwd)
-		pin_sort_for(t)
-		load_roots(t, t.root)
-		M.pending_focus, M.injected, M.injecting = nil, false, false
-		ya.dbg("[tree-dbg] toggle on; tab=", M.active_tab, " restored=", count_keys(M.expanded))
-		-- `adopt` re-applies a live native query hierarchy-aware through a
-		-- reassert queued behind the native-clear action; `suspend` and `clear`
-		-- leave the tree unfiltered until the user sets a tree query. Either
-		-- path reconciles the restored expansions against the fresh root rows.
-		if capture_native_filter() and M.filter_query then
-			ya.emit("plugin", { "tree", "reassert" })
-		else
-			reconcile_root()
-		end
-	end
-
-	apply_active()
-end
-
-function M:preview()
-	M.active_tab = M.active_tab or active_id()
-	local t = ensure_tab(M.active_tab)
-	if not t then
-		return
-	end
-	sync_base()
-	t.preview = not t.preview
-	ya.dbg("[tree-dbg] toggle preview=", tostring(t.preview))
-	apply_active()
+  if configured then return M end
+  opts = opts or {}
+  options.style = opts.style == "indent" and "indent" or "lines"
+  options.filter_mode = opts.filter_mode or "adopt"
+  options.dialogs = opts.dialogs or {}
+  options.startup = opts.startup or { tree = false, preview = true }
+  M.options = options
+  M.base_ratio = { rt.mgr.ratio[1], rt.mgr.ratio[2], rt.mgr.ratio[3] }
+  local domains = vf.tree
+  if domains then
+    domains.default = { kind = "view", run = "tree-vfs" }
+  else
+    vf.tree = { default = { kind = "view", run = "tree-vfs" } }
+  end
+  require("tree-vfs.render").configure({ style = options.style, glyphs = opts.glyphs })
+  require("tree-vfs.layout").configure(options.startup)
+  require("tree-vfs.layout").install_events()
+  require("tree-vfs.events")
+  require("tree-vfs.poller").install(0.5)
+  configured = true
+  return M
 end
 
 function M:entry(job)
-	-- `job.args` is a memoized userdata field whose cached table can be
-	-- collected between accesses, so read it once and reuse it for dispatch.
-	local args = job and job.args
-	local action = args and args[1]
-	M.active_tab = M.active_tab or active_id()
-	if M.active_tab then
-		ensure_tab(M.active_tab)
-	end
-	local t = tab_state()
-	local log_tree, log_preview
-	if t then
-		log_tree, log_preview = t.tree, t.preview
-	else
-		log_tree, log_preview = startup_defaults.tree, startup_defaults.preview
-	end
-	ya.dbg(
-		"[tree-dbg] entry action=",
-		tostring(action),
-		"tree=",
-		tostring(log_tree),
-		"preview=",
-		tostring(log_preview)
-	)
+  local args = job.args or {}
+  local action = tostring(args[1])
+  ya.dbg("[tvfs] action " .. action)
+  local entry_snapshot = snapshot()
+  local navigation_sequence = begin_navigation(entry_snapshot.tab)
+  if action == "left" then action = "collapse" end
+  if action == "right" then action = "expand" end
+  if action == "create" or action == "bulk_create" then
+    local debug_snapshot = snapshot()
+    ya.dbg("[tvfs] create is_tree=" .. tostring(debug_snapshot.is_tree) .. " cwd=" .. debug_snapshot.cwd)
+  end
+  if action == "toggle" then
+    local s = snapshot()
+    if s.is_tree then ya.emit("cd", { Url(s.cwd), raw = true }) else
+      local _, filter = read_provider_state(s.tab, s.cwd)
+      commit_provider_state(s.tab, s.cwd, nil, nil)
+      ya.emit("cd", { view_url(s.cwd, 0, s.tab, filter), raw = true })
+    end
+  elseif action == "preview" then
+    local s = snapshot()
+    layout_update(s.tab, "toggle_preview", options.startup.tree, options.startup.preview)
+  elseif action == "tab_create" then
+    local s = snapshot()
+    if s.is_tree then ya.emit("tab_create", { Url(s.cwd_url) }) else ya.emit("tab_create", { current = true }) end
+  elseif action == "open" then
+    local s = snapshot()
+    if s.is_tree and s.hovered_is_dir then
+      ya.emit("plugin", { "tree-vfs", "root_down" })
+    else ya.emit("open", {}) end
+  elseif action == "create" or action == "bulk_create" then
+    operations.create(action, args, snapshot(), options.dialogs)
+  elseif action == "rename" then
+    local s = snapshot()
+    ya.dbg("[tvfs] rename target=" .. tostring(s.hovered) .. " is_tree=" .. tostring(s.is_tree))
+    ya.emit("rename", { cursor = "before_ext" })
+  elseif action == "escape" then
+    local s = snapshot()
+    local _, filter = read_provider_state(s.tab, s.cwd)
+    if s.is_tree and filter then commit_provider_state(s.tab, s.cwd, nil, ""); ya.emit("refresh", {})
+    else ya.emit("escape", {}) end
+  end
+  if action == "bulk_create" and not snapshot().is_tree then return ya.emit("bulk", {}) end
+  if action == "paste" and not snapshot().is_tree then return ya.emit("paste", { force = args.force == true, follow = args.follow == true }) end
+  if action == "rename" and not snapshot().is_tree then return ya.emit("rename", { cursor = "before_ext" }) end
+  if action == "paste" then
+    local s = yank_snapshot()
+    local force = args.force == true
+    ya.dbg(string.format("[tvfs] paste state items=%d cut=%s dest=%s", #s.items, tostring(s.cut), tostring(s.dest)))
+    if #s.items == 0 then return end
+    reset_tasks()
+    for _, it in ipairs(s.items) do
+      local target = s.dest:join(it.name)
+      if tostring(target.physical or target) ~= tostring(it.url.physical or it.url) then
+        ya.dbg("[tvfs] paste task from=" .. tostring(it.url.physical or it.url) .. " to=" .. tostring(target.physical or target))
+        ya.task(s.cut and "move" or "copy", { from = it.url, to = target, force = force, follow = args.follow == true }):spawn()
+      end
+    end
+    if s.cut then ya.emit("unyank", {}); if s.selected > 0 then ya.emit("toggle_all", {}) end end
+    return
+  end
+  if action == "enter" then
+    local s = snapshot()
+    local cwd = s.cwd
+    local _, filter = read_provider_state(s.tab, cwd)
+    commit_provider_state(s.tab, cwd, nil, nil)
+    write_file(REALCWD, cwd)
+    ya.dbg("[tvfs] enter " .. cwd)
+    ya.emit("cd", { view_url(cwd, 0, s.tab, filter), raw = true })
+  elseif action == "expand" or action == "collapse" then
+    local s = snapshot()
+    if not s.is_tree then return ya.emit(action == "expand" and "enter" or "leave", {}) end
+    if not s.hovered then return end
+    local paths = read_provider_state(s.tab, s.cwd)
+    local set = {}; for _, path in ipairs(paths) do set[path] = true end
+    local focus = s.hovered
+    if action == "expand" then
+      if not s.hovered_is_dir or s.hovered_is_link or s.hovered_is_indirect then
+        ya.dbg("[tvfs] refusing to expand non-directory or linked directory " .. s.hovered)
+        return
+      end
+      set[s.hovered] = true
+    else
+      local target = set[s.hovered] and s.hovered_is_dir and s.hovered or s.parent
+      if not target or not set[target] then return end
+      focus = target
+      local prefix = target .. "/"
+      for path in pairs(set) do
+        if path == target or path:sub(1, #prefix) == prefix then set[path] = nil end
+      end
+    end
+     local keys = {}; for path in pairs(set) do keys[#keys + 1] = path end
+     commit_provider_state(s.tab, s.cwd, keys, nil)
+     ya.dbg("[tvfs] " .. action .. " " .. (action == "collapse" and (s.parent or s.hovered) or s.hovered))
+     if focus then arm_reveal(s.tab, navigation_sequence, s.cwd, s.hovered, focus, s.filter) end
+     ya.emit("refresh", {})
+  elseif action == "filter" or action == "filter_clear" then
+    local s = snapshot()
+    if not s.is_tree then
+      if action == "filter" then ya.emit("filter", { smart = true }) else ya.emit("escape", {}) end
+      return
+    end
+    local paths, _, order = read_provider_state(s.tab, s.cwd)
+    local function update(query)
+      commit_provider_state(s.tab, s.cwd, paths, query or "", order)
+      ya.emit("refresh", {})
+    end
+    if action == "filter_clear" then return update(nil) end
+    local stream = ya.input({ name = "filter", title = "Filter:", history = "shared", value = "", pos = { "top-center", y = 2, w = 80 }, realtime = true, debounce = 0.05 })
+    while true do
+      local value, event = stream:recv()
+      if event == 1 or event == 3 then update(value) end
+      if event == 0 or event == 1 or event == 2 then break end
+    end
+  elseif action == "root_up" then
+    local s = snapshot()
+    if not s.is_tree then return ya.emit("back", {}) end
+    local parent = s.cwd:match("^(.*)/[^/]+$")
+    if parent and parent ~= "" then
+      commit_provider_state(s.tab, parent, nil, nil)
+      ya.emit("cd", { view_url(parent, 0, s.tab), raw = true })
+    end
+  elseif action == "root_down" then
+    local s = snapshot()
+    if not s.is_tree then return ya.emit("forward", {}) end
+    if s.hovered and s.hovered_is_dir and not s.hovered_is_link and not s.hovered_is_indirect then
+      commit_provider_state(s.tab, s.hovered, nil, nil)
+      ya.emit("cd", { view_url(s.hovered, 0, s.tab), raw = true })
+    elseif s.hovered then
+      local rel = s.hovered:sub(#s.cwd + 2)
+      if rel:find("/", 1, true) then
+        ya.emit("reveal", { target = view_url(s.cwd, 0, s.tab, s.filter):join(rel), raw = true, no_dummy = true })
+      elseif rel ~= "" then ya.emit("open", {}) end
+    end
+  elseif action == "refresh" then
+    ya.dbg("[tvfs] refresh")
+    ya.emit("refresh", {})
+  elseif action == "paste-force" then
+    local s = yank_snapshot()
+    local force = action == "paste-force"
+    if #s.items == 0 then
+      ya.dbg("[tvfs] paste no yanked items")
+      return
+    end
+    ya.dbg(string.format(
+      "[tvfs] paste cut=%s force=%s items=%d dest=%s",
+      tostring(s.cut), tostring(force), #s.items, tostring(s.dest)
+    ))
+    for _, it in ipairs(s.items) do
+      local to = s.dest:join(it.name)
+      if s.cut then
+        ya.task("move", { from = it.url, to = to, force = force }):spawn()
+      else
+        ya.task("copy", { from = it.url, to = to, force = force, follow = false }):spawn()
+      end
+    end
+    if s.cut then
+      ya.emit("unyank", {})
+      if s.selected > 0 then ya.emit("escape", { select = true }) end
+    end
+  elseif action == "quit" then
+    local s = quit_snapshot()
+    ya.dbg("[tvfs] quit physical=" .. s.physical)
+    ya.emit("cd", { Url(s.physical), raw = true })
+    ya.emit("quit", {})
+  end
+end
 
-	if action == "toggle" then
-		M:toggle()
-	elseif action == "preview" then
-		M:preview()
-	elseif action == "right" then
-		M:right()
-	elseif action == "left" then
-		M:left()
-	elseif action == "root_up" then
-		M:root_up()
-	elseif action == "root_down" then
-		M:root_down()
-	elseif action == "open" then
-		M:open()
-	elseif action == "create" then
-		M:create(args)
-	elseif action == "paste" then
-		M:paste(args)
-	elseif action == "focus" then
-		M:focus()
-	elseif action == "filter" then
-		M:filter()
-	elseif action == "rename" then
-		M:rename()
-	elseif action == "escape" then
-		M:escape()
-	elseif action == "reassert" then
-		M:reassert()
-	end
+function M:tab_create(args)
+  self:entry({ args = { "tab_create" } })
 end
 
 return M
